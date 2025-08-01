@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Drop Window</title>
+    <style>
+        html, body {
+            margin: 0;
+            padding: 0;
+            background-color: transparent;
+        }
+    </style>
+</head>
+<body>
+<script>
+    window.__TAURI__.event.listen('tauri://file-drop', async (event) => {
+        await window.__TAURI__.core.invoke('update_drop_files', { paths: event.payload });
+        await window.__TAURI__.core.invoke('hide_drop_window');
+        await window.__TAURI__.event.emit('file-dropped-on-proxy', {});
+    });
+</script>
+</body>
+</html>
