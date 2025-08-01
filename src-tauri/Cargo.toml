@@ -32,4 +32,6 @@ tokio = { version = "1", features = ["sync", "process"] }
 quick-xml = { version = "^0.37.0", features = ["serialize"] }
 tempfile = "3"
 futures = "0.3"
+matroska = "0.30.0"
+ebml-iterable = "^0.6.0"
 

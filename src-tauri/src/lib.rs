@@ -1,11 +1,12 @@
 use serde::{Deserialize, Serialize, Deserializer, Serializer};
 use tauri::Emitter;
-use std::process::Stdio;
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_log::{Target, TargetKind};
 use tokio::process::Command as AsyncCommand;
 use futures::future;
 use tokio::sync::oneshot;
+use std::fs::File;
+use matroska::Matroska;
 
 mod drop;
 
@@ -15,7 +16,6 @@ fn create_command(name: &str) -> AsyncCommand {
     let mut cmd = AsyncCommand::new(name);
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x08000000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
@@ -80,52 +80,6 @@ pub struct FileData {
     tracks: Vec<Track>,
 }
 
-/// Internal struct for deserializing track properties from `mkvmerge -J` output.
-#[derive(Debug, Deserialize)]
-struct MkvMergeTrackProperties {
-    #[serde(default)]
-    track_name: Option<String>,
-    uid: u64,
-}
-
-/// Internal struct for deserializing a single track from `mkvmerge -J` output.
-#[derive(Debug, Deserialize)]
-struct MkvMergeTrack {
-    codec: String,
-    id: u64,
-    properties: MkvMergeTrackProperties,
-    #[serde(rename = "type")]
-    track_type: String,
-}
-
-/// Internal struct for deserializing the root JSON object from `mkvmerge -J` output.
-#[derive(Debug, Deserialize)]
-struct MkvMergeOutput {
-    tracks: Vec<MkvMergeTrack>,
-}
-
-/// Internal struct for deserializing the `<Targets>` element from `mkvextract` XML output.
-#[derive(Debug, Deserialize)]
-struct XmlTargets {
-    #[serde(rename = "TrackUID", default)]
-    track_uid: Vec<u64>,
-}
-
-/// Internal struct for deserializing a `<Tag>` element from `mkvextract` XML output.
-#[derive(Debug, Deserialize)]
-struct XmlTag {
-    #[serde(rename = "Targets")]
-    targets: XmlTargets,
-    #[serde(rename = "Simple", default)]
-    simple: Vec<SimpleTag>,
-}
-
-/// Internal struct for deserializing the root `<Tags>` element from `mkvextract` XML output.
-#[derive(Debug, Deserialize)]
-struct XmlTags {
-    #[serde(rename = "Tag", default)]
-    tag: Vec<XmlTag>,
-}
 
 
 /// A simple command for testing frontend-backend communication.
@@ -150,12 +104,9 @@ async fn open_file_dialog(app: tauri::AppHandle) -> Option<String> {
 
 /// Extracts all track and tag metadata from a given Matroska file.
 ///
-/// This function orchestrates calls to two external command-line tools from the MKVToolNix suite:
-/// 1. `mkvmerge -J`: To get detailed information about all tracks in the file (ID, UID, codec, etc.).
-/// 2. `mkvextract tags`: To extract all global and per-track tags into an XML format.
-///
-/// It then parses and combines the output from both tools into a single `FileData` struct
-/// that is sent to the frontend.
+/// This function natively parses the Matroska file using the `matroska` crate.
+/// It reads the file's track information and tags, then maps them into a
+/// `FileData` struct suitable for the frontend.
 ///
 /// # Arguments
 ///
@@ -163,53 +114,34 @@ async fn open_file_dialog(app: tauri::AppHandle) -> Option<String> {
 ///
 /// # Errors
 ///
-/// This function will return an error if `mkvmerge` or `mkvextract` cannot be executed,
-/// if they exit with a non-zero status code, or if their output cannot be parsed.
+/// This function will return an error if the file cannot be opened or if the file
+/// content cannot be parsed as a valid Matroska file.
 #[tauri::command]
 async fn get_file_data(path: String) -> Result<FileData, String> {
     log::info!("Getting file data for: {}", path);
-    let mkvmerge_output = create_command("mkvmerge")
-        .arg("-J")
-        .arg(&path)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .map_err(|e| e.to_string())?;
 
-    if !mkvmerge_output.status.success() {
-        let error_message = String::from_utf8_lossy(&mkvmerge_output.stderr).to_string();
-        log::error!("mkvmerge command failed: {}", error_message);
-        return Err(error_message);
-    }
+    // 1. Open file and parse with matroska crate
+    let file = File::open(&path).map_err(|e| e.to_string())?;
+    let mkv = Matroska::open(file).map_err(|e| e.to_string())?;
 
-    let mkvmerge_stdout = String::from_utf8_lossy(&mkvmerge_output.stdout);
-    log::debug!("mkvmerge stdout: {}", mkvmerge_stdout);
-
-    let mkvmerge_data: MkvMergeOutput = serde_json::from_str(&mkvmerge_stdout)
-        .map_err(|e| {
-            let error_message = format!("Failed to parse mkvmerge JSON: {}", e);
-            log::error!("{}", error_message);
-            error_message
-        })?;
-
+    // 2. Process tracks
     let mut video_count = 1;
     let mut audio_count = 1;
     let mut subtitle_count = 1;
 
-    let mut tracks: Vec<Track> = mkvmerge_data.tracks.into_iter().map(|t| {
-        let display_name = match t.track_type.as_str() {
-            "video" => {
+    let mut tracks: Vec<Track> = mkv.tracks.iter().map(|t| {
+        let display_name = match t.tracktype {
+            matroska::Tracktype::Video => {
                 let name = format!("Video#{}", video_count);
                 video_count += 1;
                 name
             }
-            "audio" => {
+            matroska::Tracktype::Audio => {
                 let name = format!("Audio#{}", audio_count);
                 audio_count += 1;
                 name
             }
-            "subtitles" => {
+            matroska::Tracktype::Subtitle => {
                 let name = format!("Subtitle#{}", subtitle_count);
                 subtitle_count += 1;
                 name
@@ -219,50 +151,50 @@ async fn get_file_data(path: String) -> Result<FileData, String> {
 
         Track {
             display_name,
-            codec: t.codec,
-            id: t.id,
-            track_name: t.properties.track_name,
-            uid: t.properties.uid,
+            codec: t.codec_id.clone(),
+            id: t.number,
+            track_name: t.name.clone(),
+            uid: t.uid,
             tags: Vec::new(),
         }
     }).collect();
 
+    // 3. Process tags
     let mut global_tags = Vec::new();
-    let mkvextract_output = create_command("mkvextract")
-        .arg("tags")
-        .arg(&path)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .map_err(|e| e.to_string())?;
+    for tag in mkv.tags {
+        let simple_tags: Vec<SimpleTag> = tag.simple.iter().map(|st| SimpleTag {
+            name: st.name.clone(),
+            string: match &st.value {
+                Some(matroska::TagValue::String(s)) => s.clone(),
+                _ => String::new(),
+            },
+            language: st.language.clone().map(|l| l.to_string()),
+        }).collect();
 
-    if mkvextract_output.status.success() {
-        let mkvextract_stdout = String::from_utf8_lossy(&mkvextract_output.stdout);
-        log::debug!("mkvextract stdout (all tags): {}", mkvextract_stdout);
-        if let Ok(xml_data) = quick_xml::de::from_str::<XmlTags>(&mkvextract_stdout) {
-            for tag in xml_data.tag {
-                if tag.targets.track_uid.is_empty() {
-                    global_tags.extend(tag.simple);
-                } else {
-                    for uid in tag.targets.track_uid {
-                        if let Some(track) = tracks.iter_mut().find(|t| t.uid == uid) {
-                            track.tags.extend(tag.simple.clone());
-                        }
+        let is_global = tag.targets.as_ref().map_or(true, |t| t.track_uids.is_empty());
+
+        if is_global {
+            global_tags.extend(simple_tags);
+        } else {
+            if let Some(targets) = &tag.targets {
+                for uid in &targets.track_uids {
+                    if let Some(track) = tracks.iter_mut().find(|t| t.uid == *uid) {
+                        track.tags.extend(simple_tags.clone());
                     }
                 }
             }
         }
-    } else {
-        log::warn!("Could not extract tags, maybe none exist.");
     }
 
+    // 4. Finalize and return
     tracks.sort_by_key(|t| t.id);
 
-    Ok(FileData {
+    let result = FileData {
         global_tags,
         tracks,
-    })
+    };
+    log::debug!("[BACKEND] Sending file data to frontend:\n{:#?}", result);
+    Ok(result)
 }
 
 /// Internal struct for serializing a `<Simple>` tag to XML.
@@ -431,7 +363,7 @@ pub fn run() {
         .setup(|app| {
             let app_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
-                let commands = ["mkvmerge", "mkvextract", "mkvpropedit"];
+                let commands = ["mkvpropedit"];
                 let checks = commands.iter().map(|&command| async move {
                     log::info!("Checking for command: {}", command);
                     let check_command = if cfg!(target_os = "windows") { "where" } else { "which" };
