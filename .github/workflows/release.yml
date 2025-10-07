@@ -58,7 +58,7 @@ jobs:
         run: npm install --frozen-lockfile
       
       - name: Fix svelte-kit sync issue
-        run: npm run svelte-kit sync
+        run: npx svelte-kit sync
 
       - name: Build Tauri application
         run: npm run tauri build -- --target ${{ matrix.target }}
