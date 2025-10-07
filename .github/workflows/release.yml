@@ -9,7 +9,28 @@ permissions:
   contents: write
 
 jobs:
-  release:
+  # Job 1: Generate changelog on Linux
+  changelog:
+    runs-on: ubuntu-latest
+    outputs:
+      tag_name: ${{ steps.tagger.outputs.tag }}
+      body_text: ${{ steps.tagger.outputs.body }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate changelog and tag
+        id: tagger
+        uses: anothrNick/github-tag-action@1.69.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WITH_V: true
+
+  # Job 2: Build on macOS and Windows in parallel
+  build:
+    needs: changelog
     strategy:
       fail-fast: false
       matrix:
@@ -18,20 +39,10 @@ jobs:
             target: aarch64-apple-darwin
           - platform: windows-latest
             target: x86_64-pc-windows-msvc
-
     runs-on: ${{ matrix.platform }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0 # Required for changelog generation
-
-      - name: Generate changelog
-        id: changelog
-        uses: anothrNick/github-tag-action@1.69.0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          WITH_V: true
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -45,6 +56,9 @@ jobs:
 
       - name: Install frontend dependencies
         run: npm install --frozen-lockfile
+      
+      - name: Fix svelte-kit sync issue
+        run: npm run svelte-kit sync
 
       - name: Build Tauri application
         run: npm run tauri build -- --target ${{ matrix.target }}
@@ -52,14 +66,13 @@ jobs:
       - name: Package and generate checksum
         shell: bash
         run: |
-          APP_NAME=$(sed -n 's/^name = "\(.*\)"/\1/p' src-turi/Cargo.toml | head -n 1)
+          APP_NAME=$(sed -n 's/^name = "\(.*\)"/\1/p' src-tauri/Cargo.toml | head -n 1)
           
           if [[ "${{ matrix.platform }}" == "macos-latest" ]]; then
             ARCHIVE_PATH="src-tauri/target/${{ matrix.target }}/release/bundle/macos/${APP_NAME}.app"
             ZIP_NAME="${APP_NAME}-macOS-arm64.zip"
             zip -r9 "${ZIP_NAME}" "${ARCHIVE_PATH}"
           else
-            # For Windows, find the .exe and zip it
             EXE_PATH=$(find src-tauri/target/${{ matrix.target }}/release -maxdepth 1 -name "*.exe" | head -n 1)
             ZIP_NAME="${APP_NAME}-Windows-x64.zip"
             7z a "${ZIP_NAME}" "${EXE_PATH}"
@@ -67,12 +80,29 @@ jobs:
           
           shasum -a 256 "${ZIP_NAME}" > "${ZIP_NAME}.sha256"
 
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-${{ matrix.platform }}
+          path: |
+            *.zip
+            *.zip.sha256
+
+  # Job 3: Publish the release once all builds are done
+  publish:
+    needs: [changelog, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
       - name: Create and upload release assets
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.changelog.outputs.tag }}
-          name: ${{ steps.changelog.outputs.tag }}
-          body: ${{ steps.changelog.outputs.body }}
-          files: |
-            *.zip
-            *.zip.sha256
+          tag_name: ${{ needs.changelog.outputs.tag_name }}
+          name: ${{ needs.changelog.outputs.tag_name }}
+          body: ${{ needs.changelog.outputs.body_text }}
+          files: artifacts/*
