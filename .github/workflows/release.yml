@@ -5,27 +5,21 @@ on:
     tags:
       - 'v*'
 
+permissions:
+  contents: write
+
 jobs:
   build-tauri:
     strategy:
       fail-fast: false
       matrix:
         include:
-          # macOS
-          - platform: macos-latest
-            target: x86_64-apple-darwin
           - platform: macos-latest
             target: aarch64-apple-darwin
-          # Linux
-          - platform: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - platform: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-          # Windows
+            asset_name: "macOS-arm64.dmg"
           - platform: windows-latest
             target: x86_64-pc-windows-msvc
-          - platform: windows-latest
-            target: aarch64-pc-windows-msvc
+            asset_name: "Windows-x86_64.msi"
 
     runs-on: ${{ matrix.platform }}
     steps:
@@ -48,7 +42,7 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         with:
           tagName: ${{ github.ref_name }}
-          releaseName: 'App v${{ github.ref_name }}'
+          releaseName: 'v${{ github.ref_name }}'
           releaseBody: 'See the assets to download this version.'
           releaseDraft: false
           prerelease: false
