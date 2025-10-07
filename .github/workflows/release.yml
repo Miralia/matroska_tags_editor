@@ -78,7 +78,12 @@ jobs:
             7z a "${ZIP_NAME}" "${EXE_PATH}"
           fi
           
-          shasum -a 256 "${ZIP_NAME}" > "${ZIP_NAME}.sha256"
+          # Generate checksum in a cross-platform way
+          if [[ "${{ matrix.platform }}" == "windows-latest" ]]; then
+            powershell -Command "(Get-FileHash -Path .\\${ZIP_NAME} -Algorithm SHA256).Hash.ToLower() + '  ' + '${ZIP_NAME}' | Out-File -FilePath .\\${ZIP_NAME}.sha256 -Encoding ascii"
+          else
+            shasum -a 256 "${ZIP_NAME}" > "${ZIP_NAME}.sha256"
+          fi
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
