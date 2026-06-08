@@ -19,6 +19,17 @@ EditableTarget target_for_tag(const TagTargets& targets) {
   return target;
 }
 
+bool same_target(const EditableTarget& left, const EditableTarget& right) {
+  return left.kind == right.kind && left.track_uid == right.track_uid;
+}
+
+bool has_target(const std::vector<EditableTarget>& targets,
+                const EditableTarget& candidate) {
+  return std::any_of(targets.begin(), targets.end(), [&](const EditableTarget& target) {
+    return same_target(target, candidate);
+  });
+}
+
 void add_simple_fields(std::vector<EditableField>& fields,
                        const TagEntry& entry,
                        std::size_t tag_index,
@@ -124,6 +135,27 @@ std::vector<EditableField> editable_fields(const TagDocument& document) {
   }
 
   return fields;
+}
+
+std::vector<EditableTarget> editable_targets(const TagDocument& document) {
+  std::vector<EditableTarget> targets;
+  targets.push_back({EditableTargetKind::General, 0});
+
+  for (const auto& track : document.tracks) {
+    EditableTarget target{EditableTargetKind::Track, track.uid};
+    if (track.uid != 0 && !has_target(targets, target)) {
+      targets.push_back(target);
+    }
+  }
+
+  for (const auto& tag : document.tags) {
+    const auto target = target_for_tag(tag.targets);
+    if (!has_target(targets, target)) {
+      targets.push_back(target);
+    }
+  }
+
+  return targets;
 }
 
 }  // namespace mte

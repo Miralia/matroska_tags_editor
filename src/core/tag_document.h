@@ -97,6 +97,8 @@ std::string describe_targets(const TagTargets& targets,
 
 bool is_hidden_extra_tag_name(const std::string& name);
 
+std::vector<EditableTarget> editable_targets(const TagDocument& document);
+
 std::vector<EditableField> editable_fields(const TagDocument& document);
 
 }  // namespace mte

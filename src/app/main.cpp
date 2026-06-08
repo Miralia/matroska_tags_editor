@@ -20,6 +20,13 @@
 
 namespace {
 
+constexpr int kDefaultWindowWidth = 480;
+constexpr int kDefaultWindowHeight = 700;
+constexpr int kMinWindowWidth = 400;
+constexpr int kMinWindowHeight = 540;
+constexpr int kNameColumnMinWidth = 150;
+constexpr int kValueColumnMinWidth = 210;
+
 enum : int {
   ID_TREE = wxID_HIGHEST + 1,
   ID_ADD_TAG,
@@ -204,7 +211,7 @@ class MainFrame final : public wxFrame {
                 wxID_ANY,
                 "Matroska Extra Tags Editor",
                 wxDefaultPosition,
-                wxSize(920, 620)) {
+                wxSize(kDefaultWindowWidth, kDefaultWindowHeight)) {
     BuildUi();
     BindEvents();
     RefreshCommands();
@@ -230,34 +237,36 @@ class MainFrame final : public wxFrame {
     file_row->Add(path_ctrl_, 1, wxEXPAND | wxALL, 4);
     file_row->Add(open_button_, 0, wxEXPAND | wxTOP | wxBOTTOM | wxRIGHT, 4);
     file_row->Add(save_button_, 0, wxEXPAND | wxTOP | wxBOTTOM | wxRIGHT, 4);
+    const wxSize compact_button_size(62, -1);
+    for (auto* button : {open_button_, save_button_}) {
+      button->SetMinSize(compact_button_size);
+    }
+    auto* action_row = new wxBoxSizer(wxHORIZONTAL);
     add_button_ = new wxButton(panel, ID_ADD_TAG, "Add");
     delete_button_ = new wxButton(panel, ID_DELETE_TAG, "Delete");
     copy_button_ = new wxButton(panel, ID_COPY_TAG, "Copy");
     paste_button_ = new wxButton(panel, ID_PASTE_TAG, "Paste");
     undo_button_ = new wxButton(panel, ID_UNDO, "Undo");
     redo_button_ = new wxButton(panel, ID_REDO, "Redo");
-    const wxSize compact_button_size(68, -1);
-    for (auto* button : {open_button_, save_button_, add_button_, delete_button_,
-                         copy_button_, paste_button_, undo_button_, redo_button_}) {
+    for (auto* button : {add_button_, delete_button_, copy_button_, paste_button_,
+                         undo_button_, redo_button_}) {
       button->SetMinSize(compact_button_size);
+      action_row->Add(button, 0, wxEXPAND | wxRIGHT | wxBOTTOM, 4);
     }
-    file_row->Add(add_button_, 0, wxEXPAND | wxTOP | wxBOTTOM | wxRIGHT, 4);
-    file_row->Add(delete_button_, 0, wxEXPAND | wxTOP | wxBOTTOM | wxRIGHT, 4);
-    file_row->Add(copy_button_, 0, wxEXPAND | wxTOP | wxBOTTOM | wxRIGHT, 4);
-    file_row->Add(paste_button_, 0, wxEXPAND | wxTOP | wxBOTTOM | wxRIGHT, 4);
-    file_row->Add(undo_button_, 0, wxEXPAND | wxTOP | wxBOTTOM | wxRIGHT, 4);
-    file_row->Add(redo_button_, 0, wxEXPAND | wxTOP | wxBOTTOM | wxRIGHT, 4);
 
     tree_ = new wxTreeListCtrl(panel, ID_TREE, wxDefaultPosition, wxDefaultSize,
                                wxTL_MULTIPLE | wxTL_DEFAULT_STYLE);
-    tree_->AppendColumn("Name", 320);
-    tree_->AppendColumn("Value", 560);
+    tree_->AppendColumn("Name", kNameColumnMinWidth);
+    tree_->AppendColumn("Value", kValueColumnMinWidth);
     tree_->SetDropTarget(new FileDropTarget(this));
 
     root->Add(file_row, 0, wxEXPAND);
+    root->Add(action_row, 0, wxLEFT | wxRIGHT, 4);
     root->Add(tree_, 1, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 3);
     panel->SetSizer(root);
+    SetMinSize(wxSize(kMinWindowWidth, kMinWindowHeight));
     CreateStatusBar();
+    CallAfter([this]() { ResizeColumns(); });
 
     wxAcceleratorEntry entries[8];
     entries[0].Set(wxACCEL_CTRL, static_cast<int>('C'), ID_COPY_TAG);
@@ -293,6 +302,7 @@ class MainFrame final : public wxFrame {
     Bind(wxEVT_TREELIST_ITEM_ACTIVATED, &MainFrame::OnItemActivated, this, ID_TREE);
     Bind(wxEVT_TREELIST_SELECTION_CHANGED, &MainFrame::OnSelectionChanged, this, ID_TREE);
     Bind(wxEVT_TREELIST_ITEM_CONTEXT_MENU, &MainFrame::OnContextMenu, this, ID_TREE);
+    Bind(wxEVT_SIZE, &MainFrame::OnSize, this);
   }
 
   bool ConfirmDiscard() {
@@ -453,6 +463,11 @@ class MainFrame final : public wxFrame {
     RefreshCommands();
   }
 
+  void OnSize(wxSizeEvent& event) {
+    event.Skip();
+    ResizeColumns();
+  }
+
   void OnContextMenu(wxTreeListEvent& event) {
     const auto item = event.GetItem();
     if (item.IsOk()) {
@@ -508,28 +523,16 @@ class MainFrame final : public wxFrame {
     tree_->DeleteAllItems();
     auto root = tree_->GetRootItem();
     const auto fields = mte::editable_fields(document_);
-
-    AppendGroup(root, {mte::EditableTargetKind::General, 0}, fields);
-
-    for (const auto& track : document_.tracks) {
-      AppendGroup(root, {mte::EditableTargetKind::Track, track.uid}, fields);
+    for (const auto& target : mte::editable_targets(document_)) {
+      AppendGroup(root, target, fields);
     }
-
-    AppendGroup(root, {mte::EditableTargetKind::Other, 0}, fields);
+    ResizeColumns();
     populating_tree_ = false;
   }
 
   void AppendGroup(wxTreeListItem root,
                    mte::EditableTarget target,
                    const std::vector<mte::EditableField>& fields) {
-    const auto has_fields =
-        std::any_of(fields.begin(), fields.end(), [&](const mte::EditableField& field) {
-          return same_target(field.target, target);
-        });
-    if (!has_fields) {
-      return;
-    }
-
     auto* group_data = new ItemData();
     group_data->kind = ItemKind::Group;
     group_data->target = target;
@@ -599,6 +602,23 @@ class MainFrame final : public wxFrame {
     paste_button_->Enable(has_document && !clipboard_.empty());
     undo_button_->Enable(history_index_ > 0);
     redo_button_->Enable(history_index_ + 1 < history_.size());
+  }
+
+  void ResizeColumns() {
+    if (!tree_) {
+      return;
+    }
+    const auto width = tree_->GetClientSize().GetWidth();
+    if (width <= 0) {
+      return;
+    }
+    const auto available = std::max(kNameColumnMinWidth + kValueColumnMinWidth,
+                                    width - 12);
+    const auto name_width =
+        std::max(kNameColumnMinWidth, std::min(190, available * 38 / 100));
+    const auto value_width = std::max(kValueColumnMinWidth, available - name_width);
+    tree_->SetColumnWidth(0, name_width);
+    tree_->SetColumnWidth(1, value_width);
   }
 
   std::string FieldName(const ItemData& data) const {
