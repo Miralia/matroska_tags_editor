@@ -181,20 +181,29 @@ jobs:
         shell: bash
         run: |
           zip_name="matroska-tags-editor-${{ needs.metadata.outputs.asset_suffix }}-${{ matrix.platform.suffix }}.zip"
+          package_root="package"
+          rm -rf "${package_root}"
+          mkdir -p "${package_root}"
+
           if [[ "${{ runner.os }}" == "macOS" ]]; then
             .github/scripts/bundle_macos_dylibs.sh build/*.app
-            zip -r9 "${zip_name}" build/*.app
+            cp -R build/*.app "${package_root}/"
+            (
+              cd "${package_root}"
+              zip -r9 "../${zip_name}" ./*.app
+            )
           else
             exe_path="$(find build -name "matroska-tags-editor.exe" | head -n 1)"
             if [[ -z "${exe_path}" ]]; then
               echo "Could not find matroska-tags-editor.exe" >&2
               exit 1
             fi
-            package_dir="package/matroska-tags-editor-${{ needs.metadata.outputs.asset_suffix }}-${{ matrix.platform.suffix }}"
-            mkdir -p "${package_dir}"
-            cp "${exe_path}" "${package_dir}/"
-            find "$(dirname "${exe_path}")" -maxdepth 1 -name "*.dll" -exec cp {} "${package_dir}/" \;
-            7z a "${zip_name}" "${package_dir}"
+            cp "${exe_path}" "${package_root}/"
+            find "$(dirname "${exe_path}")" -maxdepth 1 -name "*.dll" -exec cp {} "${package_root}/" \;
+            (
+              cd "${package_root}"
+              7z a "../${zip_name}" ./*
+            )
           fi
 
           if [[ "${{ runner.os }}" == "Windows" ]]; then
@@ -242,16 +251,35 @@ jobs:
           RELEASE_SHA: ${{ needs.metadata.outputs.release_sha }}
         shell: bash
         run: |
-          if [[ "${PRERELEASE}" == "true" ]]; then
+          git fetch --tags --force
+
+          delete_prereleases() {
+            local mode="${1:?mode required}"
             gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate \
-              --jq ".[] | select(.prerelease == true and .tag_name != \"${RELEASE_TAG}\") | .tag_name" |
+              --jq ".[] | select(.prerelease == true) | .tag_name" |
               while IFS= read -r old_tag; do
                 [[ -z "${old_tag}" ]] && continue
+
+                if [[ "${mode}" == "older" ]]; then
+                  if ! git rev-parse "${old_tag}^{commit}" >/dev/null 2>&1; then
+                    continue
+                  fi
+                  if ! git merge-base --is-ancestor "${old_tag}^{commit}" "${RELEASE_SHA}^{commit}"; then
+                    continue
+                  fi
+                fi
+
                 gh release delete "${old_tag}" --cleanup-tag --yes
               done
+          }
+
+          if [[ "${PRERELEASE}" == "true" ]]; then
+            delete_prereleases all
 
             git tag -f "${RELEASE_TAG}" "${RELEASE_SHA}"
             git push origin "refs/tags/${RELEASE_TAG}" --force
+          else
+            delete_prereleases older
           fi
 
           if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
