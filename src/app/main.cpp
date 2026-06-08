@@ -1,4 +1,5 @@
 #include <wx/dataview.h>
+#include <wx/dataobj.h>
 #include <wx/dnd.h>
 #include <wx/filedlg.h>
 #include <wx/menu.h>
@@ -64,6 +65,10 @@ std::string track_type_name(std::uint64_t type) {
     default:
       return "Track";
   }
+}
+
+bool is_file_data_format(const wxDataFormat& format) {
+  return format == wxDF_FILENAME;
 }
 
 std::string track_label(const mte::TrackInfo& track,
@@ -387,14 +392,25 @@ class MainFrame final : public wxFrame {
     RefreshCommands();
   }
 
-  void OpenPath(const std::filesystem::path& path) {
+  bool OpenPath(const std::filesystem::path& path) {
     if (path.empty()) {
-      return;
+      return false;
     }
     if (!ConfirmDiscard()) {
-      return;
+      return false;
     }
-    LoadPath(path);
+    return LoadPath(path);
+  }
+
+  bool OpenDroppedFiles(const wxArrayString& filenames) {
+    std::vector<std::filesystem::path> paths;
+    paths.reserve(filenames.size());
+    for (const auto& filename : filenames) {
+      paths.emplace_back(filename.ToStdString());
+    }
+
+    const auto path = mte::first_dropped_file_path(paths);
+    return path.has_value() && OpenPath(*path);
   }
 
  private:
@@ -441,7 +457,7 @@ class MainFrame final : public wxFrame {
     model_ = new TagTreeModel();
     tree_->AssociateModel(model_);
     model_->DecRef();
-    InstallFileDropTarget(tree_);
+    InstallTreeFileDropTarget();
 
     root->Add(file_row, 0, wxEXPAND);
     root->Add(action_row, 0, wxLEFT | wxRIGHT, 4);
@@ -485,6 +501,9 @@ class MainFrame final : public wxFrame {
     Bind(wxEVT_DATAVIEW_ITEM_ACTIVATED, &MainFrame::OnItemActivated, this, ID_TREE);
     Bind(wxEVT_DATAVIEW_SELECTION_CHANGED, &MainFrame::OnSelectionChanged, this, ID_TREE);
     Bind(wxEVT_DATAVIEW_ITEM_CONTEXT_MENU, &MainFrame::OnContextMenu, this, ID_TREE);
+    Bind(wxEVT_DATAVIEW_ITEM_DROP_POSSIBLE, &MainFrame::OnTreeFileDropPossible, this,
+         ID_TREE);
+    Bind(wxEVT_DATAVIEW_ITEM_DROP, &MainFrame::OnTreeFileDrop, this, ID_TREE);
     Bind(wxEVT_SIZE, &MainFrame::OnSize, this);
     tree_->Bind(wxEVT_LEFT_DCLICK, &MainFrame::OnTreeDoubleClick, this);
   }
@@ -492,6 +511,12 @@ class MainFrame final : public wxFrame {
   void InstallFileDropTarget(wxWindow* window) {
     if (window) {
       window->SetDropTarget(new FileDropTarget(this));
+    }
+  }
+
+  void InstallTreeFileDropTarget() {
+    if (tree_ && !tree_->EnableDropTarget(wxDataFormat(wxDF_FILENAME))) {
+      InstallFileDropTarget(tree_);
     }
   }
 
@@ -503,7 +528,7 @@ class MainFrame final : public wxFrame {
                         wxYES_NO | wxNO_DEFAULT | wxICON_WARNING, this) == wxYES;
   }
 
-  void LoadPath(const std::filesystem::path& path) {
+  bool LoadPath(const std::filesystem::path& path) {
     try {
       document_ = mte::load_tag_document(path);
       history_.clear();
@@ -515,8 +540,10 @@ class MainFrame final : public wxFrame {
       SetStatusText("Loaded " + wxString::FromUTF8(path.filename().string()));
       PopulateTree();
       RefreshCommands();
+      return true;
     } catch (const std::exception& error) {
       wxMessageBox(error.what(), "Open Error", wxOK | wxICON_ERROR, this);
+      return false;
     }
   }
 
@@ -531,6 +558,29 @@ class MainFrame final : public wxFrame {
       return;
     }
     OpenPath(std::filesystem::path(dialog.GetPath().ToStdString()));
+  }
+
+  void OnTreeFileDropPossible(wxDataViewEvent& event) {
+    event.SetDropEffect(is_file_data_format(event.GetDataFormat()) ? wxDragCopy
+                                                                   : wxDragNone);
+  }
+
+  void OnTreeFileDrop(wxDataViewEvent& event) {
+    if (!is_file_data_format(event.GetDataFormat()) || !event.GetDataBuffer() ||
+        event.GetDataSize() == 0) {
+      event.SetDropEffect(wxDragNone);
+      return;
+    }
+
+    wxFileDataObject file_data;
+    if (!file_data.SetData(event.GetDataFormat(), event.GetDataSize(),
+                           event.GetDataBuffer())) {
+      event.SetDropEffect(wxDragNone);
+      return;
+    }
+
+    event.SetDropEffect(OpenDroppedFiles(file_data.GetFilenames()) ? wxDragCopy
+                                                                   : wxDragNone);
   }
 
   void OnSave(wxCommandEvent&) {
@@ -1103,8 +1153,7 @@ bool FileDropTarget::OnDropFiles(wxCoord, wxCoord, const wxArrayString& filename
   if (!frame_ || filenames.empty()) {
     return false;
   }
-  frame_->OpenPath(std::filesystem::path(filenames.front().ToStdString()));
-  return true;
+  return frame_->OpenDroppedFiles(filenames);
 }
 
 class App final : public wxApp {

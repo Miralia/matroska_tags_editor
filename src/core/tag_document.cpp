@@ -131,6 +131,16 @@ int inline_editor_height(int cell_height, int best_height, int vertical_padding)
   return std::max(cell_height, best_height + vertical_padding);
 }
 
+std::optional<std::filesystem::path> first_dropped_file_path(
+    const std::vector<std::filesystem::path>& paths) {
+  for (const auto& path : paths) {
+    if (!path.empty()) {
+      return path;
+    }
+  }
+  return std::nullopt;
+}
+
 std::vector<EditableField> editable_fields(const TagDocument& document) {
   std::vector<EditableField> fields;
   for (std::size_t tag_index = 0; tag_index < document.tags.size(); ++tag_index) {

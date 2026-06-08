@@ -101,6 +101,9 @@ std::string editable_display_text(const std::string& value);
 
 int inline_editor_height(int cell_height, int best_height, int vertical_padding);
 
+std::optional<std::filesystem::path> first_dropped_file_path(
+    const std::vector<std::filesystem::path>& paths);
+
 std::vector<EditableTarget> editable_targets(const TagDocument& document);
 
 EditableField add_extra_tag(TagDocument& document,
