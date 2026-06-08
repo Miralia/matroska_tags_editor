@@ -27,6 +27,7 @@ include(${wxWidgets_USE_FILE})
 add_library(matroska_tags_core
   src/core/tag_document.cpp
   src/core/matroska_reader.cpp
+  src/core/matroska_writer.cpp
 )
 
 target_include_directories(matroska_tags_core

@@ -1,135 +1,187 @@
 #include "core/matroska_reader.h"
 
 #include <algorithm>
-#include <limits>
-#include <memory>
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <stdexcept>
 #include <string>
-
-#include "ebml/EbmlBinary.h"
-#include "ebml/EbmlElement.h"
-#include "ebml/EbmlMaster.h"
-#include "ebml/EbmlStream.h"
-#include "ebml/EbmlString.h"
-#include "ebml/EbmlUInteger.h"
-#include "ebml/EbmlUnicodeString.h"
-#include "ebml/IOCallback.h"
-#include "ebml/StdIOCallback.h"
-#include "matroska/KaxContexts.h"
-#include "matroska/KaxSegment.h"
-#include "matroska/KaxTags.h"
-#include "matroska/KaxTrackEntryData.h"
-#include "matroska/KaxTracks.h"
+#include <vector>
 
 namespace mte {
 namespace {
 
-using libebml::EbmlBinary;
-using libebml::EbmlElement;
-using libebml::EbmlMaster;
-using libebml::EbmlStream;
-using libebml::EbmlString;
-using libebml::EbmlUInteger;
-using libebml::EbmlUnicodeString;
-using libebml::IOCallback;
-using libebml::SCOPE_ALL_DATA;
-using libebml::StdIOCallback;
-using libmatroska::Context_KaxMatroska;
-using libmatroska::Context_KaxSegment;
-using libmatroska::KaxCodecID;
-using libmatroska::KaxSegment;
-using libmatroska::KaxTag;
-using libmatroska::KaxTagAttachmentUID;
-using libmatroska::KaxTagBinary;
-using libmatroska::KaxTagChapterUID;
-using libmatroska::KaxTagDefault;
-using libmatroska::KaxTagEditionUID;
-using libmatroska::KaxTagLanguageIETF;
-using libmatroska::KaxTagLangue;
-using libmatroska::KaxTagName;
-using libmatroska::KaxTagSimple;
-using libmatroska::KaxTagString;
-using libmatroska::KaxTagTargets;
-using libmatroska::KaxTagTargetType;
-using libmatroska::KaxTagTargetTypeValue;
-using libmatroska::KaxTagTrackUID;
-using libmatroska::KaxTags;
-using libmatroska::KaxTrackEntry;
-using libmatroska::KaxTrackName;
-using libmatroska::KaxTrackNumber;
-using libmatroska::KaxTrackType;
-using libmatroska::KaxTrackUID;
-using libmatroska::KaxTracks;
+constexpr std::uint64_t kSegment = 0x18538067;
+constexpr std::uint64_t kTracks = 0x1654AE6B;
+constexpr std::uint64_t kTrackEntry = 0xAE;
+constexpr std::uint64_t kTrackNumber = 0xD7;
+constexpr std::uint64_t kTrackUid = 0x73C5;
+constexpr std::uint64_t kTrackType = 0x83;
+constexpr std::uint64_t kTrackName = 0x536E;
+constexpr std::uint64_t kCodecId = 0x86;
+constexpr std::uint64_t kTags = 0x1254C367;
+constexpr std::uint64_t kTag = 0x7373;
+constexpr std::uint64_t kTargets = 0x63C0;
+constexpr std::uint64_t kTargetTypeValue = 0x68CA;
+constexpr std::uint64_t kTargetType = 0x63CA;
+constexpr std::uint64_t kTargetTrackUid = 0x63C5;
+constexpr std::uint64_t kTargetEditionUid = 0x63C9;
+constexpr std::uint64_t kTargetChapterUid = 0x63C4;
+constexpr std::uint64_t kTargetAttachmentUid = 0x63C6;
+constexpr std::uint64_t kSimpleTag = 0x67C8;
+constexpr std::uint64_t kTagName = 0x45A3;
+constexpr std::uint64_t kTagLanguage = 0x447A;
+constexpr std::uint64_t kTagLanguageIetf = 0x447B;
+constexpr std::uint64_t kTagDefault = 0x4484;
+constexpr std::uint64_t kTagString = 0x4487;
+constexpr std::uint64_t kTagBinary = 0x4485;
 
-constexpr auto kMaxScanSize = std::numeric_limits<uint64>::max();
+struct Vint {
+  std::uint64_t value = 0;
+  std::uint8_t length = 0;
+  bool unknown = false;
+};
 
-template <typename T>
-const T* first_child(const EbmlMaster& master) {
-  return dynamic_cast<const T*>(master.FindFirstElt(EBML_INFO(T)));
+struct Element {
+  std::uint64_t id = 0;
+  std::uint64_t start = 0;
+  std::uint64_t data_start = 0;
+  std::uint64_t data_size = 0;
+  std::uint64_t end = 0;
+  bool unknown_size = false;
+};
+
+std::uint64_t local_file_size(const std::filesystem::path& path) {
+  return static_cast<std::uint64_t>(std::filesystem::file_size(path));
 }
 
-std::uint64_t uint_value(const EbmlUInteger* element, std::uint64_t fallback = 0) {
-  if (!element) {
-    return fallback;
+std::uint8_t vint_length_from_first_byte(std::uint8_t first) {
+  for (std::uint8_t length = 1; length <= 8; ++length) {
+    if ((first & (0x80 >> (length - 1))) != 0) {
+      return length;
+    }
   }
-  return element->GetValue();
+  throw std::runtime_error("Invalid EBML variable integer.");
 }
 
-std::string ascii_value(const EbmlString* element) {
-  if (!element) {
+Vint read_vint(std::ifstream& input, bool keep_marker) {
+  const auto first_raw = input.get();
+  if (first_raw == EOF) {
+    throw std::runtime_error("Unexpected end of file while reading EBML integer.");
+  }
+
+  const auto first = static_cast<std::uint8_t>(first_raw);
+  const auto length = vint_length_from_first_byte(first);
+  std::uint64_t value = keep_marker ? first : (first & (0xFF >> length));
+  bool all_ones = !keep_marker && value == static_cast<std::uint64_t>(0xFF >> length);
+
+  for (std::uint8_t i = 1; i < length; ++i) {
+    const auto raw = input.get();
+    if (raw == EOF) {
+      throw std::runtime_error("Unexpected end of file while reading EBML integer.");
+    }
+    const auto byte = static_cast<std::uint8_t>(raw);
+    value = (value << 8) | byte;
+    all_ones = all_ones && byte == 0xFF;
+  }
+
+  return {value, length, all_ones};
+}
+
+Element read_element(std::ifstream& input, std::uint64_t container_end) {
+  const auto start = static_cast<std::uint64_t>(input.tellg());
+  const auto id = read_vint(input, true);
+  const auto size = read_vint(input, false);
+  const auto data_start = static_cast<std::uint64_t>(input.tellg());
+  const auto end = size.unknown ? container_end : data_start + size.value;
+  if (end > container_end) {
+    throw std::runtime_error("EBML element exceeds its containing element.");
+  }
+  return {id.value, start, data_start, size.value, end, size.unknown};
+}
+
+std::string read_string(std::ifstream& input, const Element& element) {
+  if (element.data_size == 0) {
     return {};
   }
-  return element->GetValue();
-}
-
-std::string utf8_value(const EbmlUnicodeString* element) {
-  if (!element) {
-    return {};
+  input.seekg(static_cast<std::streamoff>(element.data_start), std::ios::beg);
+  std::string value(static_cast<std::size_t>(element.data_size), '\0');
+  input.read(value.data(), static_cast<std::streamsize>(value.size()));
+  if (!input) {
+    throw std::runtime_error("Failed to read Matroska string element.");
   }
-  return element->GetValueUTF8();
-}
-
-std::vector<std::uint8_t> binary_value(const EbmlBinary* element) {
-  std::vector<std::uint8_t> value;
-  if (!element || !element->GetBuffer() || element->GetSize() == 0) {
-    return value;
-  }
-
-  const auto* begin = reinterpret_cast<const std::uint8_t*>(element->GetBuffer());
-  value.assign(begin, begin + element->GetSize());
   return value;
 }
 
-std::vector<std::uint64_t> repeated_uids(const EbmlMaster& master,
-                                         const libebml::EbmlCallbacks& callbacks) {
-  std::vector<std::uint64_t> values;
-  for (const auto* child : master.GetElementList()) {
-    if (!child || &child->Generic() != &callbacks) {
-      continue;
-    }
-    if (const auto* integer = dynamic_cast<const EbmlUInteger*>(child)) {
-      values.push_back(integer->GetValue());
-    }
+std::uint64_t read_uint(std::ifstream& input, const Element& element) {
+  if (element.data_size > 8) {
+    throw std::runtime_error("Matroska integer element is too large.");
   }
-  return values;
+  input.seekg(static_cast<std::streamoff>(element.data_start), std::ios::beg);
+  std::uint64_t value = 0;
+  for (std::uint64_t i = 0; i < element.data_size; ++i) {
+    const auto byte = input.get();
+    if (byte == EOF) {
+      throw std::runtime_error("Failed to read Matroska integer element.");
+    }
+    value = (value << 8) | static_cast<std::uint8_t>(byte);
+  }
+  return value;
 }
 
-TrackInfo parse_track(const KaxTrackEntry& entry) {
+std::vector<std::uint8_t> read_binary(std::ifstream& input, const Element& element) {
+  std::vector<std::uint8_t> value(static_cast<std::size_t>(element.data_size));
+  if (value.empty()) {
+    return value;
+  }
+  input.seekg(static_cast<std::streamoff>(element.data_start), std::ios::beg);
+  input.read(reinterpret_cast<char*>(value.data()), static_cast<std::streamsize>(value.size()));
+  if (!input) {
+    throw std::runtime_error("Failed to read Matroska binary element.");
+  }
+  return value;
+}
+
+TrackInfo parse_track(std::ifstream& input, const Element& entry) {
   TrackInfo track;
-  track.number = uint_value(first_child<KaxTrackNumber>(entry));
-  track.uid = uint_value(first_child<KaxTrackUID>(entry));
-  track.type = uint_value(first_child<KaxTrackType>(entry));
-  track.name = utf8_value(first_child<KaxTrackName>(entry));
-  track.codec_id = ascii_value(first_child<KaxCodecID>(entry));
+  auto offset = entry.data_start;
+  while (offset < entry.end) {
+    input.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+    const auto child = read_element(input, entry.end);
+    switch (child.id) {
+      case kTrackNumber:
+        track.number = read_uint(input, child);
+        break;
+      case kTrackUid:
+        track.uid = read_uint(input, child);
+        break;
+      case kTrackType:
+        track.type = read_uint(input, child);
+        break;
+      case kTrackName:
+        track.name = read_string(input, child);
+        break;
+      case kCodecId:
+        track.codec_id = read_string(input, child);
+        break;
+      default:
+        break;
+    }
+    offset = child.end;
+  }
   return track;
 }
 
-void parse_tracks(const KaxTracks& tracks_element, TagDocument& document) {
+void parse_tracks(std::ifstream& input, const Element& tracks, TagDocument& document) {
   document.tracks.clear();
-  for (const auto* child : tracks_element.GetElementList()) {
-    if (const auto* entry = dynamic_cast<const KaxTrackEntry*>(child)) {
-      document.tracks.push_back(parse_track(*entry));
+  auto offset = tracks.data_start;
+  while (offset < tracks.end) {
+    input.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+    const auto child = read_element(input, tracks.end);
+    if (child.id == kTrackEntry) {
+      document.tracks.push_back(parse_track(input, child));
     }
+    offset = child.end;
   }
 
   std::sort(document.tracks.begin(), document.tracks.end(),
@@ -138,97 +190,120 @@ void parse_tracks(const KaxTracks& tracks_element, TagDocument& document) {
             });
 }
 
-TagTargets parse_targets(const KaxTagTargets& targets_element) {
+TagTargets parse_targets(std::ifstream& input, const Element& targets_element) {
   TagTargets targets;
-  targets.target_type_value =
-      uint_value(first_child<KaxTagTargetTypeValue>(targets_element), 50);
-  targets.target_type = ascii_value(first_child<KaxTagTargetType>(targets_element));
-  targets.track_uids = repeated_uids(targets_element, EBML_INFO(KaxTagTrackUID));
-  targets.edition_uids = repeated_uids(targets_element, EBML_INFO(KaxTagEditionUID));
-  targets.chapter_uids = repeated_uids(targets_element, EBML_INFO(KaxTagChapterUID));
-  targets.attachment_uids =
-      repeated_uids(targets_element, EBML_INFO(KaxTagAttachmentUID));
+  auto offset = targets_element.data_start;
+  while (offset < targets_element.end) {
+    input.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+    const auto child = read_element(input, targets_element.end);
+    switch (child.id) {
+      case kTargetTypeValue:
+        targets.target_type_value = read_uint(input, child);
+        break;
+      case kTargetType:
+        targets.target_type = read_string(input, child);
+        break;
+      case kTargetTrackUid:
+        targets.track_uids.push_back(read_uint(input, child));
+        break;
+      case kTargetEditionUid:
+        targets.edition_uids.push_back(read_uint(input, child));
+        break;
+      case kTargetChapterUid:
+        targets.chapter_uids.push_back(read_uint(input, child));
+        break;
+      case kTargetAttachmentUid:
+        targets.attachment_uids.push_back(read_uint(input, child));
+        break;
+      default:
+        break;
+    }
+    offset = child.end;
+  }
   return targets;
 }
 
-SimpleTag parse_simple_tag(const KaxTagSimple& simple_element) {
+SimpleTag parse_simple_tag(std::ifstream& input, const Element& simple_element) {
   SimpleTag tag;
-  tag.name = utf8_value(first_child<KaxTagName>(simple_element));
-  tag.language = ascii_value(first_child<KaxTagLangue>(simple_element));
-  tag.language_bcp47 = ascii_value(first_child<KaxTagLanguageIETF>(simple_element));
-  tag.is_default = uint_value(first_child<KaxTagDefault>(simple_element), 1) != 0;
-
-  if (const auto* binary = first_child<KaxTagBinary>(simple_element)) {
-    tag.value_type = TagValueType::Binary;
-    tag.binary_value = binary_value(binary);
-  } else {
-    tag.value_type = TagValueType::String;
-    tag.string_value = utf8_value(first_child<KaxTagString>(simple_element));
-  }
-
-  for (const auto* child : simple_element.GetElementList()) {
-    if (const auto* nested = dynamic_cast<const KaxTagSimple*>(child)) {
-      tag.children.push_back(parse_simple_tag(*nested));
+  auto offset = simple_element.data_start;
+  while (offset < simple_element.end) {
+    input.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+    const auto child = read_element(input, simple_element.end);
+    switch (child.id) {
+      case kTagName:
+        tag.name = read_string(input, child);
+        break;
+      case kTagLanguage:
+        tag.language = read_string(input, child);
+        break;
+      case kTagLanguageIetf:
+        tag.language_bcp47 = read_string(input, child);
+        break;
+      case kTagDefault:
+        tag.is_default = read_uint(input, child) != 0;
+        break;
+      case kTagString:
+        tag.value_type = TagValueType::String;
+        tag.string_value = read_string(input, child);
+        break;
+      case kTagBinary:
+        tag.value_type = TagValueType::Binary;
+        tag.binary_value = read_binary(input, child);
+        break;
+      case kSimpleTag:
+        tag.children.push_back(parse_simple_tag(input, child));
+        break;
+      default:
+        break;
     }
+    offset = child.end;
   }
-
   return tag;
 }
 
-TagEntry parse_tag_entry(const KaxTag& tag_element) {
+TagEntry parse_tag(std::ifstream& input, const Element& tag_element) {
   TagEntry entry;
-  if (const auto* targets = first_child<KaxTagTargets>(tag_element)) {
-    entry.targets = parse_targets(*targets);
-  }
-
-  for (const auto* child : tag_element.GetElementList()) {
-    if (const auto* simple = dynamic_cast<const KaxTagSimple*>(child)) {
-      entry.simple_tags.push_back(parse_simple_tag(*simple));
+  auto offset = tag_element.data_start;
+  while (offset < tag_element.end) {
+    input.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+    const auto child = read_element(input, tag_element.end);
+    if (child.id == kTargets) {
+      entry.targets = parse_targets(input, child);
+    } else if (child.id == kSimpleTag) {
+      entry.simple_tags.push_back(parse_simple_tag(input, child));
     }
+    offset = child.end;
   }
   return entry;
 }
 
-void parse_tags(const KaxTags& tags_element, TagDocument& document) {
+void parse_tags(std::ifstream& input, const Element& tags, TagDocument& document) {
   document.tags.clear();
-  for (const auto* child : tags_element.GetElementList()) {
-    if (const auto* tag = dynamic_cast<const KaxTag*>(child)) {
-      document.tags.push_back(parse_tag_entry(*tag));
+  auto offset = tags.data_start;
+  while (offset < tags.end) {
+    input.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+    const auto child = read_element(input, tags.end);
+    if (child.id == kTag) {
+      document.tags.push_back(parse_tag(input, child));
     }
+    offset = child.end;
   }
 }
 
-void skip_element(IOCallback& input, const EbmlElement& element) {
-  if (element.IsFiniteSize()) {
-    input.setFilePointer(element.GetEndPosition(), libebml::seek_beginning);
-  }
-}
-
-void read_segment_children(KaxSegment& segment, IOCallback& input, TagDocument& document) {
-  const auto segment_end = segment.IsFiniteSize()
-                               ? segment.GetEndPosition()
-                               : std::numeric_limits<uint64>::max();
-  input.setFilePointer(segment.GetDataStart(), libebml::seek_beginning);
-  EbmlStream segment_stream(input);
-
-  while (input.getFilePointer() < segment_end) {
-    int upper_level = 0;
-    std::unique_ptr<EbmlElement> child(segment_stream.FindNextElement(
-        Context_KaxSegment, upper_level, kMaxScanSize, true));
-    if (!child || upper_level > 0) {
+Element find_segment(std::ifstream& input, std::uint64_t end) {
+  auto offset = std::uint64_t{0};
+  while (offset < end) {
+    input.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+    const auto element = read_element(input, end);
+    if (element.id == kSegment) {
+      return element;
+    }
+    if (element.unknown_size) {
       break;
     }
-
-    if (auto* tracks = dynamic_cast<KaxTracks*>(child.get())) {
-      tracks->ReadData(input, SCOPE_ALL_DATA);
-      parse_tracks(*tracks, document);
-    } else if (auto* tags = dynamic_cast<KaxTags*>(child.get())) {
-      tags->ReadData(input, SCOPE_ALL_DATA);
-      parse_tags(*tags, document);
-    } else {
-      skip_element(input, *child);
-    }
+    offset = element.end;
   }
+  throw std::runtime_error("No Matroska segment was found in the file.");
 }
 
 }  // namespace
@@ -237,26 +312,25 @@ TagDocument load_tag_document(const std::filesystem::path& path) {
   TagDocument document;
   document.path = path;
 
-  StdIOCallback input(path.string().c_str(), MODE_READ);
-  EbmlStream stream(input);
-
-  while (true) {
-    int upper_level = 0;
-    std::unique_ptr<EbmlElement> element(
-        stream.FindNextElement(Context_KaxMatroska, upper_level, kMaxScanSize, true));
-    if (!element) {
-      break;
-    }
-
-    if (auto* segment = dynamic_cast<KaxSegment*>(element.get())) {
-      read_segment_children(*segment, input, document);
-      return document;
-    }
-
-    skip_element(input, *element);
+  std::ifstream input(path, std::ios::binary);
+  if (!input) {
+    throw std::runtime_error("Failed to open Matroska file.");
   }
 
-  throw std::runtime_error("No Matroska segment was found in the file.");
+  const auto segment = find_segment(input, local_file_size(path));
+  auto offset = segment.data_start;
+  while (offset < segment.end) {
+    input.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+    const auto child = read_element(input, segment.end);
+    if (child.id == kTracks) {
+      parse_tracks(input, child, document);
+    } else if (child.id == kTags) {
+      parse_tags(input, child, document);
+    }
+    offset = child.end;
+  }
+
+  return document;
 }
 
 }  // namespace mte
