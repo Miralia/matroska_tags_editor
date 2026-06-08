@@ -273,6 +273,16 @@ jobs:
               done
           }
 
+          clear_latest_full_releases() {
+            gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate \
+              --jq ".[] | select(.draft == false and .prerelease == false) | .id" |
+              while IFS= read -r release_id; do
+                [[ -z "${release_id}" ]] && continue
+                gh api -X PATCH "repos/${GITHUB_REPOSITORY}/releases/${release_id}" \
+                  -f make_latest=false >/dev/null
+              done
+          }
+
           if [[ "${PRERELEASE}" == "true" ]]; then
             delete_prereleases all
 
@@ -300,4 +310,8 @@ jobs:
               --title "${RELEASE_NAME}" \
               --notes-file release-notes.md \
               "${prerelease_flag[@]}"
+          fi
+
+          if [[ "${PRERELEASE}" == "true" ]]; then
+            clear_latest_full_releases
           fi

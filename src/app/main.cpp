@@ -38,8 +38,7 @@ enum : int {
   ID_PASTE_TAG,
   ID_SELECT_ALL,
   ID_UNDO,
-  ID_REDO,
-  ID_INLINE_EDITOR
+  ID_REDO
 };
 
 enum class ItemKind {
@@ -217,8 +216,25 @@ class TagTreeModel final : public wxDataViewModel {
         mte::editable_display_text(column == 0 ? node->name : node->value));
   }
 
-  bool SetValue(const wxVariant&, const wxDataViewItem&, unsigned int) override {
-    return false;
+  bool SetValue(const wxVariant& variant,
+                const wxDataViewItem& item,
+                unsigned int column) override {
+    auto* node = NodeFromItem(item);
+    if (!node || node->data.kind != ItemKind::Field || column > 1) {
+      return false;
+    }
+
+    auto value = variant.GetString().ToStdString();
+    if (value == mte::editable_display_text("")) {
+      value.clear();
+    }
+
+    if (column == 0) {
+      node->name = value;
+    } else {
+      node->value = value;
+    }
+    return true;
   }
 
   bool GetAttr(const wxDataViewItem& item,
@@ -352,6 +368,14 @@ class TagTreeModel final : public wxDataViewModel {
     return node ? &node->data : nullptr;
   }
 
+  std::string TextForItemColumn(const wxDataViewItem& item, unsigned column) const {
+    const auto* node = NodeFromItem(item);
+    if (!node || node->data.kind != ItemKind::Field || column > 1) {
+      return {};
+    }
+    return column == 0 ? node->name : node->value;
+  }
+
  private:
   static wxDataViewItem ItemFromNode(const ViewNode* node) {
     return wxDataViewItem(const_cast<ViewNode*>(node));
@@ -453,10 +477,10 @@ class MainFrame final : public wxFrame {
 
     tree_ = new wxDataViewCtrl(panel, ID_TREE, wxDefaultPosition, wxDefaultSize,
                                wxDV_MULTIPLE | wxDV_ROW_LINES);
-    tree_->AppendTextColumn("Name", 0, wxDATAVIEW_CELL_INERT,
+    tree_->AppendTextColumn("Name", 0, wxDATAVIEW_CELL_EDITABLE,
                             kNameColumnMinWidth, wxALIGN_LEFT,
                             wxDATAVIEW_COL_RESIZABLE);
-    tree_->AppendTextColumn("Value", 1, wxDATAVIEW_CELL_INERT,
+    tree_->AppendTextColumn("Value", 1, wxDATAVIEW_CELL_EDITABLE,
                             kValueColumnMinWidth, wxALIGN_LEFT,
                             wxDATAVIEW_COL_RESIZABLE);
     model_ = new TagTreeModel();
@@ -504,6 +528,10 @@ class MainFrame final : public wxFrame {
     Bind(wxEVT_MENU, &MainFrame::OnSelectAll, this, ID_SELECT_ALL);
     Bind(wxEVT_CLOSE_WINDOW, &MainFrame::OnClose, this);
     Bind(wxEVT_DATAVIEW_ITEM_ACTIVATED, &MainFrame::OnItemActivated, this, ID_TREE);
+    Bind(wxEVT_DATAVIEW_ITEM_START_EDITING, &MainFrame::OnItemStartEditing, this,
+         ID_TREE);
+    Bind(wxEVT_DATAVIEW_ITEM_VALUE_CHANGED, &MainFrame::OnItemValueChanged, this,
+         ID_TREE);
     Bind(wxEVT_DATAVIEW_SELECTION_CHANGED, &MainFrame::OnSelectionChanged, this, ID_TREE);
     Bind(wxEVT_DATAVIEW_ITEM_CONTEXT_MENU, &MainFrame::OnContextMenu, this, ID_TREE);
     Bind(wxEVT_DATAVIEW_ITEM_DROP_POSSIBLE, &MainFrame::OnTreeFileDropPossible, this,
@@ -699,9 +727,6 @@ class MainFrame final : public wxFrame {
 
   void OnSize(wxSizeEvent& event) {
     event.Skip();
-    if (inline_editor_) {
-      FinishInlineEdit(true);
-    }
     ResizeColumns();
   }
 
@@ -781,6 +806,37 @@ class MainFrame final : public wxFrame {
     }
 
     StartInlineEdit(event.GetItem(), column);
+  }
+
+  void OnItemStartEditing(wxDataViewEvent& event) {
+    auto* data = model_->DataForItem(event.GetItem());
+    const auto column = static_cast<unsigned>(std::max(event.GetColumn(), 0));
+    if (!mte::can_start_inline_edit(data && data->kind == ItemKind::Field,
+                                    column, false)) {
+      event.Veto();
+    }
+  }
+
+  void OnItemValueChanged(wxDataViewEvent& event) {
+    auto* data = model_->DataForItem(event.GetItem());
+    const auto column = static_cast<unsigned>(std::max(event.GetColumn(), 0));
+    if (!mte::can_start_inline_edit(data && data->kind == ItemKind::Field,
+                                    column, false)) {
+      return;
+    }
+
+    const auto value = model_->TextForItemColumn(event.GetItem(), column);
+    const auto original = column == 0 ? FieldName(*data) : FieldValue(*data);
+    if (value == original) {
+      return;
+    }
+
+    const auto item_data = *data;
+    CallAfter([this, item_data, column, value]() {
+      ApplyFieldColumn(item_data, column, value);
+      PushHistory();
+      PopulateTree();
+    });
   }
 
   void PopulateTree() {
@@ -1015,10 +1071,6 @@ class MainFrame final : public wxFrame {
   }
 
   void StartInlineEdit(wxDataViewItem item, unsigned column) {
-    if (inline_editor_) {
-      FinishInlineEdit(true);
-      return;
-    }
     if (!item.IsOk()) {
       return;
     }
@@ -1033,94 +1085,7 @@ class MainFrame final : public wxFrame {
       return;
     }
 
-    auto rect = InlineEditorRect(item, column, data_view_column);
-    if (rect.IsEmpty()) {
-      return;
-    }
-
-    const auto value = column == 0 ? FieldName(*data) : FieldValue(*data);
-    inline_item_ = item;
-    inline_column_ = column;
-    inline_original_value_ = value;
-    inline_editor_ =
-        new wxTextCtrl(tree_, ID_INLINE_EDITOR, wxString::FromUTF8(value),
-                       wxDefaultPosition, wxDefaultSize, wxTE_PROCESS_ENTER);
-    inline_editor_->SetFont(tree_->GetFont());
-    const auto original_height = rect.GetHeight();
-    rect.Deflate(1, 0);
-    const auto editor_height =
-        mte::inline_editor_height(original_height,
-                                  inline_editor_->GetBestSize().GetHeight(),
-                                  tree_->FromDIP(4));
-    rect.SetY(std::max(0, rect.GetY() - (editor_height - original_height) / 2));
-    rect.SetHeight(editor_height);
-    inline_editor_->SetSize(rect);
-    inline_editor_->SetSelection(-1, -1);
-    inline_editor_->Bind(wxEVT_TEXT_ENTER, &MainFrame::OnInlineTextEnter, this);
-    inline_editor_->Bind(wxEVT_CHAR_HOOK, &MainFrame::OnInlineCharHook, this);
-    inline_editor_->Bind(wxEVT_KILL_FOCUS, &MainFrame::OnInlineKillFocus, this);
-    inline_editor_->SetFocus();
-  }
-
-  void OnInlineTextEnter(wxCommandEvent&) {
-    FinishInlineEdit(true);
-  }
-
-  void OnInlineCharHook(wxKeyEvent& event) {
-    if (event.GetKeyCode() == WXK_ESCAPE) {
-      FinishInlineEdit(false);
-      return;
-    }
-    if (event.GetKeyCode() == WXK_RETURN || event.GetKeyCode() == WXK_NUMPAD_ENTER) {
-      FinishInlineEdit(true);
-      return;
-    }
-    event.Skip();
-  }
-
-  void OnInlineKillFocus(wxFocusEvent& event) {
-    event.Skip();
-    if (ending_inline_edit_) {
-      return;
-    }
-    CallAfter([this]() {
-      if (inline_editor_) {
-        FinishInlineEdit(true);
-      }
-    });
-  }
-
-  void FinishInlineEdit(bool commit) {
-    if (!inline_editor_) {
-      return;
-    }
-
-    ending_inline_edit_ = true;
-    auto* editor = inline_editor_;
-    const auto value = editor->GetValue().ToStdString();
-    const auto item = inline_item_;
-    const auto column = inline_column_;
-    inline_editor_ = nullptr;
-    inline_item_ = wxDataViewItem();
-    inline_column_ = 0;
-    editor->Destroy();
-    ending_inline_edit_ = false;
-
-    if (!commit || value == inline_original_value_) {
-      inline_original_value_.clear();
-      return;
-    }
-
-    inline_original_value_.clear();
-    if (!item.IsOk()) {
-      return;
-    }
-    auto* data = model_->DataForItem(item);
-    if (data && data->kind == ItemKind::Field) {
-      ApplyFieldColumn(*data, column, value);
-      PushHistory();
-      PopulateTree();
-    }
+    tree_->EditItem(item, data_view_column);
   }
 
   bool ValidateBeforeSave() {
@@ -1184,32 +1149,6 @@ class MainFrame final : public wxFrame {
     return 0;
   }
 
-  wxRect InlineEditorRect(const wxDataViewItem& item,
-                          unsigned column,
-                          wxDataViewColumn* data_view_column) const {
-    auto rect = tree_->GetItemRect(item, data_view_column);
-    if (!rect.IsEmpty()) {
-      return rect;
-    }
-
-    auto row_rect = tree_->GetItemRect(item);
-    if (row_rect.IsEmpty()) {
-      return row_rect;
-    }
-
-    const auto name_width = ColumnWidth(0);
-    const auto client_width = std::max(tree_->GetClientSize().GetWidth(),
-                                       name_width + ColumnWidth(1));
-    if (column == 0) {
-      row_rect.SetX(0);
-      row_rect.SetWidth(std::min(name_width, client_width));
-    } else {
-      row_rect.SetX(name_width);
-      row_rect.SetWidth(std::max(0, client_width - name_width));
-    }
-    return row_rect;
-  }
-
   wxTextCtrl* path_ctrl_ = nullptr;
   wxButton* open_button_ = nullptr;
   wxButton* save_button_ = nullptr;
@@ -1221,23 +1160,18 @@ class MainFrame final : public wxFrame {
   wxButton* redo_button_ = nullptr;
   wxDataViewCtrl* tree_ = nullptr;
   TagTreeModel* model_ = nullptr;
-  wxTextCtrl* inline_editor_ = nullptr;
 
   mte::TagDocument document_;
   std::vector<mte::TagDocument> history_;
   std::vector<mte::SimpleTag> clipboard_;
   std::size_t history_index_ = 0;
   std::size_t saved_history_index_ = 0;
-  wxDataViewItem inline_item_;
-  unsigned inline_column_ = 0;
-  std::string inline_original_value_;
   std::optional<InlineEditRequest> pending_inline_edit_;
   wxDataViewItem inline_item_to_edit_;
   unsigned inline_column_to_edit_ = 0;
   wxDataViewItem last_inline_click_item_;
   unsigned last_inline_click_column_ = 0;
   bool dirty_ = false;
-  bool ending_inline_edit_ = false;
 };
 
 bool FileDropTarget::OnDropFiles(wxCoord, wxCoord, const wxArrayString& filenames) {
