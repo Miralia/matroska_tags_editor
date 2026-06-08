@@ -1,15 +1,19 @@
 .DS_Store
-node_modules
-/build
-/.svelte-kit
-/package
 .env
 .env.*
 !.env.example
-vite.config.js.timestamp-*
-vite.config.ts.timestamp-*
 
-# Tauri build artifacts
-/src-tauri/target
+# Native build artifacts
+/build
+/cmake-build-*
+/out
 dist/
+
+# Local-only development tests and fixtures
+/tests-local/
+/fixtures-local/
+*.local.test.*
+
+# Logs and temporary files
 *.log
+*.tmp

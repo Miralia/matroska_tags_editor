@@ -1,0 +1,9 @@
+{
+  "name": "matroska-tags-editor",
+  "version-string": "0.2.0",
+  "dependencies": [
+    "libebml",
+    "libmatroska",
+    "wxwidgets"
+  ]
+}

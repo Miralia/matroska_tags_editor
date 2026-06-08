@@ -9,77 +9,53 @@ permissions:
   contents: write
 
 jobs:
-  # Job 1: Generate changelog on Linux
-  changelog:
-    runs-on: ubuntu-latest
-    outputs:
-      tag_name: ${{ steps.tagger.outputs.tag }}
-      body_text: ${{ steps.tagger.outputs.body }}
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Generate changelog and tag
-        id: tagger
-        uses: anothrNick/github-tag-action@1.69.0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          WITH_V: true
-
-  # Job 2: Build on macOS and Windows in parallel
   build:
-    needs: changelog
     strategy:
       fail-fast: false
       matrix:
         include:
           - platform: macos-latest
-            target: aarch64-apple-darwin
+            artifact: matroska-tags-editor-macOS-arm64
           - platform: windows-latest
-            target: x86_64-pc-windows-msvc
+            artifact: matroska-tags-editor-Windows-x64
     runs-on: ${{ matrix.platform }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - name: Install dependencies on macOS
+        if: runner.os == 'macOS'
+        run: brew install libebml libmatroska wxwidgets
+
+      - name: Bootstrap vcpkg on Windows
+        if: runner.os == 'Windows'
+        uses: lukka/run-vcpkg@v11
         with:
-          node-version: '20'
+          vcpkgJsonGlob: vcpkg.json
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - name: Install frontend dependencies
-        run: npm install --frozen-lockfile
-      
-      - name: Fix svelte-kit sync issue
-        run: npx svelte-kit sync
-
-      - name: Build Tauri application
-        run: npm run tauri build -- --target ${{ matrix.target }}
-
-      - name: Package and generate checksum
+      - name: Configure
         shell: bash
         run: |
-          APP_NAME=$(sed -n 's/^name = "\(.*\)"/\1/p' src-tauri/Cargo.toml | head -n 1)
-          
-          if [[ "${{ matrix.platform }}" == "macos-latest" ]]; then
-            ARCHIVE_PATH="src-tauri/target/${{ matrix.target }}/release/bundle/macos/${APP_NAME}.app"
-            ZIP_NAME="${APP_NAME}-macOS-arm64.zip"
-            zip -r9 "${ZIP_NAME}" "${ARCHIVE_PATH}"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE="${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
           else
-            EXE_PATH=$(find src-tauri/target/${{ matrix.target }}/release -maxdepth 1 -name "*.exe" | head -n 1)
-            ZIP_NAME="${APP_NAME}-Windows-x64.zip"
+            cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          fi
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Package
+        shell: bash
+        run: |
+          ZIP_NAME="${{ matrix.artifact }}.zip"
+          if [[ "${{ runner.os }}" == "macOS" ]]; then
+            zip -r9 "${ZIP_NAME}" build/*.app
+          else
+            EXE_PATH=$(find build -name "matroska-tags-editor.exe" | head -n 1)
             7z a "${ZIP_NAME}" "${EXE_PATH}"
           fi
-          
-          # Generate checksum in a cross-platform way
-          if [[ "${{ matrix.platform }}" == "windows-latest" ]]; then
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
             powershell -Command "(Get-FileHash -Path .\\${ZIP_NAME} -Algorithm SHA256).Hash.ToLower() + '  ' + '${ZIP_NAME}' | Out-File -FilePath .\\${ZIP_NAME}.sha256 -Encoding ascii"
           else
             shasum -a 256 "${ZIP_NAME}" > "${ZIP_NAME}.sha256"
@@ -93,9 +69,8 @@ jobs:
             *.zip
             *.zip.sha256
 
-  # Job 3: Publish the release once all builds are done
   publish:
-    needs: [changelog, build]
+    needs: build
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
@@ -107,7 +82,4 @@ jobs:
       - name: Create and upload release assets
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ needs.changelog.outputs.tag_name }}
-          name: ${{ needs.changelog.outputs.tag_name }}
-          body: ${{ needs.changelog.outputs.body_text }}
           files: artifacts/*
