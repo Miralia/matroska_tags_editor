@@ -158,4 +158,47 @@ std::vector<EditableTarget> editable_targets(const TagDocument& document) {
   return targets;
 }
 
+EditableField add_extra_tag(TagDocument& document,
+                            EditableTarget target,
+                            const std::string& name,
+                            const std::string& value) {
+  SimpleTag tag;
+  tag.name = name;
+  tag.string_value = value;
+
+  for (std::size_t index = 0; index < document.tags.size(); ++index) {
+    auto& entry = document.tags[index];
+    const auto entry_target = target_for_tag(entry.targets);
+    if (same_target(entry_target, target)) {
+      entry.simple_tags.push_back(tag);
+
+      EditableField field;
+      field.id = "tag:" + std::to_string(index) + ":" +
+                 std::to_string(entry.simple_tags.size() - 1);
+      field.name = name;
+      field.value = value;
+      field.target = target;
+      field.tag_index = index;
+      field.simple_path = {entry.simple_tags.size() - 1};
+      return field;
+    }
+  }
+
+  TagEntry entry;
+  if (target.kind == EditableTargetKind::Track && target.track_uid != 0) {
+    entry.targets.track_uids.push_back(target.track_uid);
+  }
+  entry.simple_tags.push_back(tag);
+  document.tags.push_back(std::move(entry));
+
+  EditableField field;
+  field.id = "tag:" + std::to_string(document.tags.size() - 1) + ":0";
+  field.name = name;
+  field.value = value;
+  field.target = target;
+  field.tag_index = document.tags.size() - 1;
+  field.simple_path = {0};
+  return field;
+}
+
 }  // namespace mte

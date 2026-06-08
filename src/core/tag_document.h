@@ -99,6 +99,11 @@ bool is_hidden_extra_tag_name(const std::string& name);
 
 std::vector<EditableTarget> editable_targets(const TagDocument& document);
 
+EditableField add_extra_tag(TagDocument& document,
+                            EditableTarget target,
+                            const std::string& name,
+                            const std::string& value);
+
 std::vector<EditableField> editable_fields(const TagDocument& document);
 
 }  // namespace mte

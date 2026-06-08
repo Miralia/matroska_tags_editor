@@ -1,15 +1,16 @@
+#include <wx/dataview.h>
 #include <wx/dnd.h>
 #include <wx/filedlg.h>
 #include <wx/menu.h>
 #include <wx/msgdlg.h>
 #include <wx/sizer.h>
-#include <wx/stattext.h>
 #include <wx/textctrl.h>
 #include <wx/treelist.h>
 #include <wx/wx.h>
 
 #include <algorithm>
 #include <filesystem>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -36,7 +37,8 @@ enum : int {
   ID_PASTE_TAG,
   ID_SELECT_ALL,
   ID_UNDO,
-  ID_REDO
+  ID_REDO,
+  ID_INLINE_EDITOR
 };
 
 enum class ItemKind {
@@ -153,44 +155,20 @@ void erase_visible_simple_tags(std::vector<mte::SimpleTag>& tags) {
              tags.end());
 }
 
-class FieldEditDialog final : public wxDialog {
- public:
-  FieldEditDialog(wxWindow* parent,
-                  const std::string& title,
-                  const std::string& name,
-                  const std::string& value,
-                  bool name_editable)
-      : wxDialog(parent, wxID_ANY, title, wxDefaultPosition, wxDefaultSize,
-                 wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER) {
-    auto* root = new wxBoxSizer(wxVERTICAL);
-    name_ = AddTextField(root, "Name", name);
-    value_ = AddTextField(root, "Value", value);
-    name_->Enable(name_editable);
-    root->Add(CreateSeparatedButtonSizer(wxOK | wxCANCEL), 0, wxEXPAND | wxALL, 12);
-    SetSizerAndFit(root);
-    SetMinSize(wxSize(440, -1));
-  }
+bool has_visible_simple_tags(const std::vector<mte::SimpleTag>& tags) {
+  return std::any_of(tags.begin(), tags.end(), [](const mte::SimpleTag& tag) {
+    if (tag.value_type == mte::TagValueType::String &&
+        !mte::is_hidden_extra_tag_name(tag.name)) {
+      return true;
+    }
+    return has_visible_simple_tags(tag.children);
+  });
+}
 
-  std::string Name() const {
-    return name_->GetValue().ToStdString();
-  }
-
-  std::string Value() const {
-    return value_->GetValue().ToStdString();
-  }
-
- private:
-  wxTextCtrl* AddTextField(wxBoxSizer* root,
-                           const wxString& label,
-                           const std::string& value) {
-    root->Add(new wxStaticText(this, wxID_ANY, label), 0, wxLEFT | wxRIGHT | wxTOP, 12);
-    auto* ctrl = new wxTextCtrl(this, wxID_ANY, wxString::FromUTF8(value));
-    root->Add(ctrl, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 12);
-    return ctrl;
-  }
-
-  wxTextCtrl* name_ = nullptr;
-  wxTextCtrl* value_ = nullptr;
+struct InlineEditRequest {
+  std::size_t tag_index = 0;
+  std::vector<std::size_t> simple_path;
+  unsigned column = 0;
 };
 
 class MainFrame;
@@ -303,6 +281,7 @@ class MainFrame final : public wxFrame {
     Bind(wxEVT_TREELIST_SELECTION_CHANGED, &MainFrame::OnSelectionChanged, this, ID_TREE);
     Bind(wxEVT_TREELIST_ITEM_CONTEXT_MENU, &MainFrame::OnContextMenu, this, ID_TREE);
     Bind(wxEVT_SIZE, &MainFrame::OnSize, this);
+    tree_->GetDataView()->Bind(wxEVT_LEFT_DCLICK, &MainFrame::OnTreeDoubleClick, this);
   }
 
   bool ConfirmDiscard() {
@@ -348,6 +327,10 @@ class MainFrame final : public wxFrame {
   }
 
   void OnSave(wxCommandEvent&) {
+    if (!ValidateBeforeSave()) {
+      return;
+    }
+
     try {
       mte::save_tag_document(document_);
       saved_history_index_ = history_index_;
@@ -364,15 +347,8 @@ class MainFrame final : public wxFrame {
       return;
     }
 
-    const auto context = CurrentContext();
-    FieldEditDialog dialog(this, "Add Tag", "TITLE", "", true);
-    if (dialog.ShowModal() != wxID_OK) {
-      return;
-    }
-
-    const auto name = dialog.Name();
-    const auto value = dialog.Value();
-    AddExtraTag(context, name, value);
+    const auto field = mte::add_extra_tag(document_, CurrentContext(), "", "");
+    pending_inline_edit_ = InlineEditRequest{field.tag_index, field.simple_path, 0};
     SetStatusText("Added tag");
     PushHistory();
     PopulateTree();
@@ -411,7 +387,7 @@ class MainFrame final : public wxFrame {
 
     const auto context = CurrentContext();
     for (const auto& tag : clipboard_) {
-      AddExtraTag(context, tag.name, tag.string_value);
+      mte::add_extra_tag(document_, context, tag.name, tag.string_value);
     }
     PushHistory();
     PopulateTree();
@@ -465,7 +441,36 @@ class MainFrame final : public wxFrame {
 
   void OnSize(wxSizeEvent& event) {
     event.Skip();
+    if (inline_editor_) {
+      FinishInlineEdit(true);
+    }
     ResizeColumns();
+  }
+
+  void OnTreeDoubleClick(wxMouseEvent& event) {
+    auto* view = tree_->GetDataView();
+    wxDataViewItem data_view_item;
+    wxDataViewColumn* data_view_column = nullptr;
+    view->HitTest(event.GetPosition(), data_view_item, data_view_column);
+    if (!data_view_item.IsOk() || !data_view_column) {
+      event.Skip();
+      return;
+    }
+
+    const auto column = data_view_column->GetModelColumn();
+    if (column > 1) {
+      event.Skip();
+      return;
+    }
+
+    wxTreeListItem item(static_cast<wxTreeListModelNode*>(data_view_item.GetID()));
+    auto* data = static_cast<ItemData*>(tree_->GetItemData(item));
+    if (!data || data->kind != ItemKind::Field) {
+      event.Skip();
+      return;
+    }
+
+    StartInlineEdit(item, column);
   }
 
   void OnContextMenu(wxTreeListEvent& event) {
@@ -478,6 +483,7 @@ class MainFrame final : public wxFrame {
     auto* data = SelectedData().empty() ? nullptr : SelectedData().front();
     const auto is_group = data && data->kind == ItemKind::Group;
     if (is_group) {
+      const auto group_has_tags = GroupHasVisibleTags(*data);
       menu.Append(ID_ADD_TAG, "Add Tag");
       menu.AppendSeparator();
       menu.Append(ID_COPY_TAG, "Copy All Tags");
@@ -485,6 +491,9 @@ class MainFrame final : public wxFrame {
       menu.Append(ID_PASTE_TAG, "Paste Tags");
       menu.AppendSeparator();
       menu.Append(ID_DELETE_TAG, "Delete Visible Fields");
+      menu.Enable(ID_COPY_TAG, group_has_tags);
+      menu.Enable(ID_CUT_TAG, group_has_tags);
+      menu.Enable(ID_DELETE_TAG, group_has_tags);
     } else {
       menu.Append(ID_UNDO, "Undo");
       menu.Append(ID_REDO, "Redo");
@@ -509,17 +518,12 @@ class MainFrame final : public wxFrame {
       return;
     }
 
-    FieldEditDialog dialog(this, "Edit Tag", FieldName(*data), FieldValue(*data), true);
-    if (dialog.ShowModal() != wxID_OK) {
-      return;
-    }
-    ApplyField(*data, dialog.Name(), dialog.Value());
-    PushHistory();
-    PopulateTree();
+    StartInlineEdit(event.GetItem(), 0);
   }
 
   void PopulateTree() {
     populating_tree_ = true;
+    inline_item_to_edit_.Unset();
     tree_->DeleteAllItems();
     auto root = tree_->GetRootItem();
     const auto fields = mte::editable_fields(document_);
@@ -528,6 +532,16 @@ class MainFrame final : public wxFrame {
     }
     ResizeColumns();
     populating_tree_ = false;
+    if (inline_item_to_edit_.IsOk()) {
+      const auto item = inline_item_to_edit_;
+      const auto column = inline_column_to_edit_;
+      pending_inline_edit_.reset();
+      CallAfter([this, item, column]() {
+        tree_->Select(item);
+        tree_->EnsureVisible(item);
+        StartInlineEdit(item, column);
+      });
+    }
   }
 
   void AppendGroup(wxTreeListItem root,
@@ -555,6 +569,12 @@ class MainFrame final : public wxFrame {
       const auto item =
           tree_->AppendItem(group, wxString::FromUTF8(field.name), -1, -1, data);
       tree_->SetItemText(item, 1, wxString::FromUTF8(field.value));
+      if (pending_inline_edit_ &&
+          pending_inline_edit_->tag_index == field.tag_index &&
+          pending_inline_edit_->simple_path == field.simple_path) {
+        inline_item_to_edit_ = item;
+        inline_column_to_edit_ = pending_inline_edit_->column;
+      }
     }
     tree_->Expand(group);
   }
@@ -650,15 +670,28 @@ class MainFrame final : public wxFrame {
     }
   }
 
+  void ApplyFieldColumn(const ItemData& data, unsigned column, const std::string& value) {
+    if (data.tag_index < document_.tags.size()) {
+      if (auto* tag = find_simple(document_.tags[data.tag_index], data.simple_path)) {
+        if (column == 0) {
+          tag->name = value;
+        } else {
+          tag->string_value = value;
+        }
+      }
+    }
+  }
+
   void DeleteSelected() {
     const auto selected = SelectedData();
     if (selected.empty()) {
       return;
     }
 
+    bool changed = false;
     for (const auto* data : selected) {
       if (data->kind == ItemKind::Group) {
-        DeleteGroup(*data);
+        changed = DeleteGroup(*data) || changed;
       }
     }
 
@@ -678,21 +711,28 @@ class MainFrame final : public wxFrame {
     for (const auto& data : extra_items) {
       if (data.tag_index < document_.tags.size()) {
         erase_simple(document_.tags[data.tag_index], data.simple_path);
+        changed = true;
       }
+    }
+    if (!changed) {
+      return;
     }
     RemoveEmptyTagEntries();
     PushHistory();
     PopulateTree();
   }
 
-  void DeleteGroup(const ItemData& group) {
+  bool DeleteGroup(const ItemData& group) {
+    auto changed = false;
     for (auto& entry : document_.tags) {
       const auto target = TargetForTag(entry.targets);
       if (same_target(target, group.target)) {
+        const auto had_visible_tags = has_visible_simple_tags(entry.simple_tags);
         erase_visible_simple_tags(entry.simple_tags);
+        changed = had_visible_tags || changed;
       }
     }
-
+    return changed;
   }
 
   void CopyGroup(const ItemData& group) {
@@ -718,29 +758,6 @@ class MainFrame final : public wxFrame {
     }
   }
 
-  void AddExtraTag(mte::EditableTarget target,
-                   const std::string& name,
-                   const std::string& value) {
-    mte::SimpleTag tag;
-    tag.name = name;
-    tag.string_value = value;
-
-    for (auto& entry : document_.tags) {
-      const auto entry_target = TargetForTag(entry.targets);
-      if (entry_target.kind == target.kind && entry_target.track_uid == target.track_uid) {
-        entry.simple_tags.push_back(tag);
-        return;
-      }
-    }
-
-    mte::TagEntry entry;
-    if (target.kind == mte::EditableTargetKind::Track && target.track_uid != 0) {
-      entry.targets.track_uids.push_back(target.track_uid);
-    }
-    entry.simple_tags.push_back(tag);
-    document_.tags.push_back(std::move(entry));
-  }
-
   static mte::EditableTarget TargetForTag(const mte::TagTargets& targets) {
     if (!targets.track_uids.empty()) {
       return {mte::EditableTargetKind::Track, targets.track_uids.front()};
@@ -759,6 +776,130 @@ class MainFrame final : public wxFrame {
         document_.tags.end());
   }
 
+  bool GroupHasVisibleTags(const ItemData& group) const {
+    for (const auto& entry : document_.tags) {
+      const auto target = TargetForTag(entry.targets);
+      if (same_target(target, group.target) &&
+          has_visible_simple_tags(entry.simple_tags)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  void StartInlineEdit(wxTreeListItem item, unsigned column) {
+    if (inline_editor_) {
+      FinishInlineEdit(true);
+      return;
+    }
+    if (!item.IsOk() || column > 1) {
+      return;
+    }
+    auto* data = static_cast<ItemData*>(tree_->GetItemData(item));
+    if (!data || data->kind != ItemKind::Field) {
+      return;
+    }
+
+    auto* view = tree_->GetDataView();
+    auto* data_view_column = view->GetColumn(column);
+    if (!data_view_column) {
+      return;
+    }
+
+    wxDataViewItem data_view_item(static_cast<void*>(item.GetID()));
+    auto rect = view->GetItemRect(data_view_item, data_view_column);
+    if (rect.IsEmpty()) {
+      return;
+    }
+
+    rect.Deflate(1, 1);
+    const auto value = column == 0 ? FieldName(*data) : FieldValue(*data);
+    inline_item_ = item;
+    inline_column_ = column;
+    inline_original_value_ = value;
+    inline_editor_ =
+        new wxTextCtrl(view, ID_INLINE_EDITOR, wxString::FromUTF8(value), rect.GetPosition(),
+                       rect.GetSize(), wxTE_PROCESS_ENTER);
+    inline_editor_->SetFont(view->GetFont());
+    inline_editor_->SetSelection(-1, -1);
+    inline_editor_->Bind(wxEVT_TEXT_ENTER, &MainFrame::OnInlineTextEnter, this);
+    inline_editor_->Bind(wxEVT_CHAR_HOOK, &MainFrame::OnInlineCharHook, this);
+    inline_editor_->Bind(wxEVT_KILL_FOCUS, &MainFrame::OnInlineKillFocus, this);
+    inline_editor_->SetFocus();
+  }
+
+  void OnInlineTextEnter(wxCommandEvent&) {
+    FinishInlineEdit(true);
+  }
+
+  void OnInlineCharHook(wxKeyEvent& event) {
+    if (event.GetKeyCode() == WXK_ESCAPE) {
+      FinishInlineEdit(false);
+      return;
+    }
+    if (event.GetKeyCode() == WXK_RETURN || event.GetKeyCode() == WXK_NUMPAD_ENTER) {
+      FinishInlineEdit(true);
+      return;
+    }
+    event.Skip();
+  }
+
+  void OnInlineKillFocus(wxFocusEvent& event) {
+    event.Skip();
+    if (ending_inline_edit_) {
+      return;
+    }
+    CallAfter([this]() {
+      if (inline_editor_) {
+        FinishInlineEdit(true);
+      }
+    });
+  }
+
+  void FinishInlineEdit(bool commit) {
+    if (!inline_editor_) {
+      return;
+    }
+
+    ending_inline_edit_ = true;
+    auto* editor = inline_editor_;
+    const auto value = editor->GetValue().ToStdString();
+    const auto item = inline_item_;
+    const auto column = inline_column_;
+    inline_editor_ = nullptr;
+    inline_item_.Unset();
+    inline_column_ = 0;
+    editor->Destroy();
+    ending_inline_edit_ = false;
+
+    if (!commit || value == inline_original_value_) {
+      inline_original_value_.clear();
+      return;
+    }
+
+    inline_original_value_.clear();
+    if (!item.IsOk()) {
+      return;
+    }
+    auto* data = static_cast<ItemData*>(tree_->GetItemData(item));
+    if (data && data->kind == ItemKind::Field) {
+      ApplyFieldColumn(*data, column, value);
+      PushHistory();
+      PopulateTree();
+    }
+  }
+
+  bool ValidateBeforeSave() {
+    for (const auto& field : mte::editable_fields(document_)) {
+      if (field.name.empty() || field.value.empty()) {
+        wxMessageBox("All visible tags must have a name and a value.",
+                     "Validation Error", wxOK | wxICON_WARNING, this);
+        return false;
+      }
+    }
+    return true;
+  }
+
   wxTextCtrl* path_ctrl_ = nullptr;
   wxButton* open_button_ = nullptr;
   wxButton* save_button_ = nullptr;
@@ -769,14 +910,22 @@ class MainFrame final : public wxFrame {
   wxButton* undo_button_ = nullptr;
   wxButton* redo_button_ = nullptr;
   wxTreeListCtrl* tree_ = nullptr;
+  wxTextCtrl* inline_editor_ = nullptr;
 
   mte::TagDocument document_;
   std::vector<mte::TagDocument> history_;
   std::vector<mte::SimpleTag> clipboard_;
   std::size_t history_index_ = 0;
   std::size_t saved_history_index_ = 0;
+  wxTreeListItem inline_item_;
+  unsigned inline_column_ = 0;
+  std::string inline_original_value_;
+  std::optional<InlineEditRequest> pending_inline_edit_;
+  wxTreeListItem inline_item_to_edit_;
+  unsigned inline_column_to_edit_ = 0;
   bool dirty_ = false;
   bool populating_tree_ = false;
+  bool ending_inline_edit_ = false;
 };
 
 bool FileDropTarget::OnDropFiles(wxCoord, wxCoord, const wxArrayString& filenames) {
