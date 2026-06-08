@@ -384,7 +384,7 @@ class MainFrame final : public wxFrame {
   MainFrame()
       : wxFrame(nullptr,
                 wxID_ANY,
-                "Matroska Extra Tags Editor",
+                "Matroska Tags Editor",
                 wxDefaultPosition,
                 wxSize(kDefaultWindowWidth, kDefaultWindowHeight)) {
     BuildUi();

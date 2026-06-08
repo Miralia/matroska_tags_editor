@@ -1,8 +1,8 @@
 cmake_minimum_required(VERSION 3.22)
 
 project(MatroskaTagsEditor
-  VERSION 0.2.0
-  DESCRIPTION "Matroska extra tags editor"
+  VERSION 1.0.0
+  DESCRIPTION "Matroska tags editor"
   LANGUAGES CXX
 )
 
@@ -73,7 +73,7 @@ endif()
 if(APPLE)
   set_target_properties(matroska-tags-editor PROPERTIES
     MACOSX_BUNDLE TRUE
-    MACOSX_BUNDLE_BUNDLE_NAME "Matroska Extra Tags Editor"
+    MACOSX_BUNDLE_BUNDLE_NAME "Matroska Tags Editor"
     MACOSX_BUNDLE_GUI_IDENTIFIER "com.miralia.matroska-tags-editor"
   )
 endif()
