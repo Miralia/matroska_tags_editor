@@ -2,23 +2,75 @@ name: Release
 
 on:
   push:
+    branches:
+      - main
     tags:
-      - 'v*'
+      - "v*"
 
 permissions:
   contents: write
 
 jobs:
+  metadata:
+    name: Prepare release metadata
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.meta.outputs.release_tag }}
+      release_name: ${{ steps.meta.outputs.release_name }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+      asset_suffix: ${{ steps.meta.outputs.asset_suffix }}
+      release_sha: ${{ steps.meta.outputs.release_sha }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release metadata
+        id: meta
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            release_tag="${GITHUB_REF_NAME}"
+            release_name="${GITHUB_REF_NAME}"
+            prerelease="false"
+            asset_suffix="${GITHUB_REF_NAME}"
+          else
+            release_tag="pre-release"
+            release_name="Pre-release"
+            prerelease="true"
+            asset_suffix="pre-release"
+          fi
+
+          {
+            echo "release_tag=${release_tag}"
+            echo "release_name=${release_name}"
+            echo "prerelease=${prerelease}"
+            echo "asset_suffix=${asset_suffix}"
+            echo "release_sha=${GITHUB_SHA}"
+          } >> "${GITHUB_OUTPUT}"
+
   build:
+    name: Build ${{ matrix.platform.suffix }}
+    needs: metadata
+    env:
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/vcpkg-bincache
+      VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/vcpkg-bincache,readwrite
+      VCPKG_DEFAULT_TRIPLET: x64-windows-release
+      VCPKG_TARGET_TRIPLET: x64-windows-release
+      VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+      VCPKG_OVERLAY_TRIPLETS: ${{ github.workspace }}/ci/vcpkg-triplets
+      VCPKG_DOWNLOADS: ${{ github.workspace }}/vcpkg/downloads
+      VCPKG_FORCE_SYSTEM_BINARIES: 1
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - platform: macos-latest
-            artifact: matroska-tags-editor-macOS-arm64
-          - platform: windows-latest
-            artifact: matroska-tags-editor-Windows-x64
-    runs-on: ${{ matrix.platform }}
+        platform:
+          - runner: macos-latest
+            suffix: macOS-arm64
+          - runner: windows-latest
+            suffix: Windows-x64
+    runs-on: ${{ matrix.platform.runner }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -27,17 +79,97 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install libebml libmatroska wxwidgets
 
+      - name: Checkout vcpkg source
+        if: runner.os == 'Windows'
+        uses: actions/checkout@v4
+        with:
+          repository: microsoft/vcpkg
+          ref: 10ceb139a610ebf3c6aa49cdc4a4b7f3db5d3f2b
+          path: vcpkg
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Restore vcpkg binary cache
+        if: runner.os == 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: |
+            vcpkg-bincache
+            vcpkg/downloads
+            vcpkg/vcpkg.exe
+          key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json', 'ci/vcpkg-triplets/*.cmake') }}
+          restore-keys: |
+            vcpkg-${{ runner.os }}-
+
+      - name: Verify Windows archive tools
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (Test-Path "C:\Program Files\7-Zip\7z.exe") {
+            "C:\Program Files\7-Zip" | Out-File -FilePath $env:GITHUB_PATH -Append
+          }
+
+          $sevenZip = Get-Command 7z -ErrorAction Stop
+          Write-Host "Using 7-Zip at $($sevenZip.Source)"
+          & $sevenZip.Source | Select-Object -First 2
+
+      - name: Prepare vcpkg cache directories
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mkdir -p "${VCPKG_DEFAULT_BINARY_CACHE}"
+          mkdir -p "${VCPKG_DOWNLOADS}"
+
       - name: Bootstrap vcpkg on Windows
         if: runner.os == 'Windows'
-        uses: lukka/run-vcpkg@v11
-        with:
-          vcpkgJsonGlob: vcpkg.json
+        shell: pwsh
+        run: |
+          $repoVcpkg = Join-Path $env:VCPKG_ROOT "vcpkg.exe"
+          $candidates = @()
+          if ($env:VCPKG_INSTALLATION_ROOT) {
+            $candidates += (Join-Path $env:VCPKG_INSTALLATION_ROOT "vcpkg.exe")
+          }
+          $candidates += "C:\vcpkg\vcpkg.exe"
+
+          $pathVcpkg = Get-Command vcpkg -ErrorAction SilentlyContinue
+          if ($pathVcpkg) {
+            $candidates += $pathVcpkg.Source
+          }
+
+          if (-not (Test-Path $repoVcpkg)) {
+            foreach ($candidate in ($candidates | Select-Object -Unique)) {
+              if ($candidate -and (Test-Path $candidate)) {
+                Write-Host "Using preinstalled vcpkg executable from $candidate"
+                Copy-Item -Force $candidate $repoVcpkg
+                break
+              }
+            }
+          }
+
+          if (-not (Test-Path $repoVcpkg)) {
+            & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat" -disableMetrics
+          }
+
+          if (-not (Test-Path $repoVcpkg)) {
+            throw "Could not prepare vcpkg.exe"
+          }
+
+          & $repoVcpkg version
+
+      - name: Prefetch vcpkg source archives
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: "& ./.github/scripts/prefetch_vcpkg_sources.ps1"
 
       - name: Configure
         shell: bash
         run: |
           if [[ "${{ runner.os }}" == "Windows" ]]; then
-            cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE="${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+            cmake -S . -B build \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_TOOLCHAIN_FILE="${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake" \
+              -DVCPKG_TARGET_TRIPLET="${VCPKG_TARGET_TRIPLET}" \
+              -DVCPKG_OVERLAY_TRIPLETS="${VCPKG_OVERLAY_TRIPLETS}"
           else
             cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
           fi
@@ -48,38 +180,96 @@ jobs:
       - name: Package
         shell: bash
         run: |
-          ZIP_NAME="${{ matrix.artifact }}.zip"
+          zip_name="matroska-tags-editor-${{ needs.metadata.outputs.asset_suffix }}-${{ matrix.platform.suffix }}.zip"
           if [[ "${{ runner.os }}" == "macOS" ]]; then
-            zip -r9 "${ZIP_NAME}" build/*.app
+            .github/scripts/bundle_macos_dylibs.sh build/*.app
+            zip -r9 "${zip_name}" build/*.app
           else
-            EXE_PATH=$(find build -name "matroska-tags-editor.exe" | head -n 1)
-            7z a "${ZIP_NAME}" "${EXE_PATH}"
+            exe_path="$(find build -name "matroska-tags-editor.exe" | head -n 1)"
+            if [[ -z "${exe_path}" ]]; then
+              echo "Could not find matroska-tags-editor.exe" >&2
+              exit 1
+            fi
+            package_dir="package/matroska-tags-editor-${{ needs.metadata.outputs.asset_suffix }}-${{ matrix.platform.suffix }}"
+            mkdir -p "${package_dir}"
+            cp "${exe_path}" "${package_dir}/"
+            find "$(dirname "${exe_path}")" -maxdepth 1 -name "*.dll" -exec cp {} "${package_dir}/" \;
+            7z a "${zip_name}" "${package_dir}"
           fi
+
           if [[ "${{ runner.os }}" == "Windows" ]]; then
-            powershell -Command "(Get-FileHash -Path .\\${ZIP_NAME} -Algorithm SHA256).Hash.ToLower() + '  ' + '${ZIP_NAME}' | Out-File -FilePath .\\${ZIP_NAME}.sha256 -Encoding ascii"
+            powershell -Command "(Get-FileHash -Path .\\${zip_name} -Algorithm SHA256).Hash.ToLower() + '  ' + '${zip_name}' | Out-File -FilePath .\\${zip_name}.sha256 -Encoding ascii"
           else
-            shasum -a 256 "${ZIP_NAME}" > "${ZIP_NAME}.sha256"
+            shasum -a 256 "${zip_name}" > "${zip_name}.sha256"
           fi
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: release-assets-${{ matrix.platform }}
+          name: release-assets-${{ needs.metadata.outputs.asset_suffix }}-${{ matrix.platform.suffix }}
           path: |
             *.zip
             *.zip.sha256
 
   publish:
-    needs: build
+    name: Publish release
+    needs:
+      - metadata
+      - build
     runs-on: ubuntu-latest
     steps:
-      - name: Download all artifacts
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
+          pattern: release-assets-${{ needs.metadata.outputs.asset_suffix }}-*
           merge-multiple: true
 
-      - name: Create and upload release assets
-        uses: softprops/action-gh-release@v2
-        with:
-          files: artifacts/*
+      - name: Generate release notes
+        run: .github/scripts/generate_release_notes.sh "${{ needs.metadata.outputs.release_tag }}" "${{ needs.metadata.outputs.release_sha }}" "${{ needs.metadata.outputs.prerelease }}" > release-notes.md
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.metadata.outputs.release_tag }}
+          RELEASE_NAME: ${{ needs.metadata.outputs.release_name }}
+          PRERELEASE: ${{ needs.metadata.outputs.prerelease }}
+          RELEASE_SHA: ${{ needs.metadata.outputs.release_sha }}
+        shell: bash
+        run: |
+          if [[ "${PRERELEASE}" == "true" ]]; then
+            gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate \
+              --jq ".[] | select(.prerelease == true and .tag_name != \"${RELEASE_TAG}\") | .tag_name" |
+              while IFS= read -r old_tag; do
+                [[ -z "${old_tag}" ]] && continue
+                gh release delete "${old_tag}" --cleanup-tag --yes
+              done
+
+            git tag -f "${RELEASE_TAG}" "${RELEASE_SHA}"
+            git push origin "refs/tags/${RELEASE_TAG}" --force
+          fi
+
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" artifacts/* --clobber
+            gh release edit "${RELEASE_TAG}" \
+              --title "${RELEASE_NAME}" \
+              --notes-file release-notes.md \
+              $([[ "${PRERELEASE}" == "true" ]] && echo "--prerelease" || echo "--latest")
+          else
+            prerelease_flag=()
+            if [[ "${PRERELEASE}" == "true" ]]; then
+              prerelease_flag=(--prerelease)
+            else
+              prerelease_flag=(--latest)
+            fi
+            gh release create "${RELEASE_TAG}" artifacts/* \
+              --target "${RELEASE_SHA}" \
+              --title "${RELEASE_NAME}" \
+              --notes-file release-notes.md \
+              "${prerelease_flag[@]}"
+          fi

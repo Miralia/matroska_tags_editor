@@ -5,6 +5,7 @@
 
 # Native build artifacts
 /build
+/build-*
 /cmake-build-*
 /out
 dist/

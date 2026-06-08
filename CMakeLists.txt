@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.22)
 
 project(MatroskaTagsEditor
   VERSION 0.2.0
-  DESCRIPTION "Native Matroska tags editor"
+  DESCRIPTION "Matroska extra tags editor"
   LANGUAGES CXX
 )
 
@@ -41,6 +41,14 @@ target_link_libraries(matroska_tags_core
     Matroska::matroska
 )
 
+if(WIN32)
+  target_compile_definitions(matroska_tags_core
+    PUBLIC
+      NOMINMAX
+      WIN32_LEAN_AND_MEAN
+  )
+endif()
+
 add_executable(matroska-tags-editor
   src/app/main.cpp
 )
@@ -51,10 +59,21 @@ target_link_libraries(matroska-tags-editor
     ${wxWidgets_LIBRARIES}
 )
 
+if(WIN32)
+  set_target_properties(matroska-tags-editor PROPERTIES
+    WIN32_EXECUTABLE TRUE
+  )
+
+  add_custom_command(TARGET matroska-tags-editor POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy -t $<TARGET_FILE_DIR:matroska-tags-editor> $<TARGET_RUNTIME_DLLS:matroska-tags-editor>
+    COMMAND_EXPAND_LISTS
+  )
+endif()
+
 if(APPLE)
   set_target_properties(matroska-tags-editor PROPERTIES
     MACOSX_BUNDLE TRUE
-    MACOSX_BUNDLE_BUNDLE_NAME "Matroska Tags Editor"
+    MACOSX_BUNDLE_BUNDLE_NAME "Matroska Extra Tags Editor"
     MACOSX_BUNDLE_GUI_IDENTIFIER "com.miralia.matroska-tags-editor"
   )
 endif()
