@@ -103,6 +103,12 @@ int inline_editor_height(int cell_height, int best_height, int vertical_padding)
 
 bool can_start_inline_edit(bool is_field, unsigned column, bool has_modifier);
 
+unsigned inline_edit_column_from_x(int x, int name_column_width);
+
+unsigned inline_edit_event_column(int event_column,
+                                  bool has_active_edit,
+                                  unsigned active_column);
+
 std::optional<std::filesystem::path> first_dropped_file_path(
     const std::vector<std::filesystem::path>& paths);
 

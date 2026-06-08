@@ -527,8 +527,9 @@ class MainFrame final : public wxFrame {
     Bind(wxEVT_MENU, &MainFrame::OnRedo, this, ID_REDO);
     Bind(wxEVT_MENU, &MainFrame::OnSelectAll, this, ID_SELECT_ALL);
     Bind(wxEVT_CLOSE_WINDOW, &MainFrame::OnClose, this);
-    Bind(wxEVT_DATAVIEW_ITEM_ACTIVATED, &MainFrame::OnItemActivated, this, ID_TREE);
     Bind(wxEVT_DATAVIEW_ITEM_START_EDITING, &MainFrame::OnItemStartEditing, this,
+         ID_TREE);
+    Bind(wxEVT_DATAVIEW_ITEM_EDITING_DONE, &MainFrame::OnItemEditingDone, this,
          ID_TREE);
     Bind(wxEVT_DATAVIEW_ITEM_VALUE_CHANGED, &MainFrame::OnItemValueChanged, this,
          ID_TREE);
@@ -538,7 +539,6 @@ class MainFrame final : public wxFrame {
          ID_TREE);
     Bind(wxEVT_DATAVIEW_ITEM_DROP, &MainFrame::OnTreeFileDrop, this, ID_TREE);
     Bind(wxEVT_SIZE, &MainFrame::OnSize, this);
-    tree_->Bind(wxEVT_LEFT_UP, &MainFrame::OnTreeLeftUp, this);
     tree_->Bind(wxEVT_LEFT_DCLICK, &MainFrame::OnTreeDoubleClick, this);
   }
 
@@ -730,21 +730,6 @@ class MainFrame final : public wxFrame {
     ResizeColumns();
   }
 
-  void OnTreeLeftUp(wxMouseEvent& event) {
-    const auto target = ResolveInlineEditTarget(event.GetPosition(),
-                                                MouseHasEditModifier(event));
-    event.Skip();
-    if (!target.has_value()) {
-      return;
-    }
-
-    last_inline_click_item_ = target->item;
-    last_inline_click_column_ = target->column;
-    CallAfter([this, item = target->item, column = target->column]() {
-      StartInlineEdit(item, column);
-    });
-  }
-
   void OnTreeDoubleClick(wxMouseEvent& event) {
     const auto target = ResolveInlineEditTarget(event.GetPosition(),
                                                 MouseHasEditModifier(event));
@@ -753,8 +738,6 @@ class MainFrame final : public wxFrame {
       return;
     }
 
-    last_inline_click_item_ = target->item;
-    last_inline_click_column_ = target->column;
     StartInlineEdit(target->item, target->column);
   }
 
@@ -797,29 +780,29 @@ class MainFrame final : public wxFrame {
     PopupMenu(&menu);
   }
 
-  void OnItemActivated(wxDataViewEvent& event) {
-    auto* data = model_->DataForItem(event.GetItem());
-    const auto column = LastClickedColumnForItem(event.GetItem());
-    if (!mte::can_start_inline_edit(data && data->kind == ItemKind::Field,
-                                    column, false)) {
-      return;
-    }
-
-    StartInlineEdit(event.GetItem(), column);
-  }
-
   void OnItemStartEditing(wxDataViewEvent& event) {
     auto* data = model_->DataForItem(event.GetItem());
-    const auto column = static_cast<unsigned>(std::max(event.GetColumn(), 0));
+    const auto column = EventEditColumn(event);
     if (!mte::can_start_inline_edit(data && data->kind == ItemKind::Field,
                                     column, false)) {
       event.Veto();
+      ClearActiveEdit();
+      return;
     }
+    TrackActiveEdit(event.GetItem(), column);
+  }
+
+  void OnItemEditingDone(wxDataViewEvent& event) {
+    if (event.IsEditCancelled()) {
+      ClearActiveEdit();
+      return;
+    }
+    CallAfter([this]() { ClearActiveEdit(); });
   }
 
   void OnItemValueChanged(wxDataViewEvent& event) {
     auto* data = model_->DataForItem(event.GetItem());
-    const auto column = static_cast<unsigned>(std::max(event.GetColumn(), 0));
+    const auto column = EventEditColumn(event);
     if (!mte::can_start_inline_edit(data && data->kind == ItemKind::Field,
                                     column, false)) {
       return;
@@ -832,6 +815,7 @@ class MainFrame final : public wxFrame {
     }
 
     const auto item_data = *data;
+    ClearActiveEdit();
     CallAfter([this, item_data, column, value]() {
       ApplyFieldColumn(item_data, column, value);
       PushHistory();
@@ -1085,6 +1069,7 @@ class MainFrame final : public wxFrame {
       return;
     }
 
+    TrackActiveEdit(item, column);
     tree_->EditItem(item, data_view_column);
   }
 
@@ -1105,8 +1090,7 @@ class MainFrame final : public wxFrame {
   }
 
   unsigned ColumnFromPoint(const wxPoint& point) const {
-    const auto name_width = ColumnWidth(0);
-    return point.x < name_width ? 0 : 1;
+    return mte::inline_edit_column_from_x(point.x, ColumnWidth(0));
   }
 
   int ColumnWidth(unsigned column) const {
@@ -1130,8 +1114,7 @@ class MainFrame final : public wxFrame {
       return std::nullopt;
     }
 
-    auto column = data_view_column ? data_view_column->GetModelColumn()
-                                   : ColumnFromPoint(point);
+    auto column = ColumnFromPoint(point);
     auto* data = model_->DataForItem(item);
     if (!mte::can_start_inline_edit(data && data->kind == ItemKind::Field,
                                     column, has_modifier)) {
@@ -1141,12 +1124,25 @@ class MainFrame final : public wxFrame {
     return InlineEditTarget{item, column};
   }
 
-  unsigned LastClickedColumnForItem(const wxDataViewItem& item) const {
-    if (item.IsOk() && last_inline_click_item_.IsOk() &&
-        item.GetID() == last_inline_click_item_.GetID()) {
-      return last_inline_click_column_;
-    }
-    return 0;
+  unsigned EventEditColumn(const wxDataViewEvent& event) const {
+    return mte::inline_edit_event_column(event.GetColumn(),
+                                         HasActiveEdit(event.GetItem()),
+                                         active_edit_column_);
+  }
+
+  bool HasActiveEdit(const wxDataViewItem& item) const {
+    return active_edit_item_.IsOk() && item.IsOk() &&
+           active_edit_item_.GetID() == item.GetID();
+  }
+
+  void TrackActiveEdit(const wxDataViewItem& item, unsigned column) {
+    active_edit_item_ = item;
+    active_edit_column_ = column;
+  }
+
+  void ClearActiveEdit() {
+    active_edit_item_ = wxDataViewItem();
+    active_edit_column_ = 0;
   }
 
   wxTextCtrl* path_ctrl_ = nullptr;
@@ -1169,8 +1165,8 @@ class MainFrame final : public wxFrame {
   std::optional<InlineEditRequest> pending_inline_edit_;
   wxDataViewItem inline_item_to_edit_;
   unsigned inline_column_to_edit_ = 0;
-  wxDataViewItem last_inline_click_item_;
-  unsigned last_inline_click_column_ = 0;
+  wxDataViewItem active_edit_item_;
+  unsigned active_edit_column_ = 0;
   bool dirty_ = false;
 };
 

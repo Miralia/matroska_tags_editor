@@ -135,6 +135,19 @@ bool can_start_inline_edit(bool is_field, unsigned column, bool has_modifier) {
   return is_field && column <= 1 && !has_modifier;
 }
 
+unsigned inline_edit_column_from_x(int x, int name_column_width) {
+  return x < name_column_width ? 0 : 1;
+}
+
+unsigned inline_edit_event_column(int event_column,
+                                  bool has_active_edit,
+                                  unsigned active_column) {
+  if (event_column >= 0) {
+    return static_cast<unsigned>(event_column);
+  }
+  return has_active_edit ? active_column : 0;
+}
+
 std::optional<std::filesystem::path> first_dropped_file_path(
     const std::vector<std::filesystem::path>& paths) {
   for (const auto& path : paths) {
