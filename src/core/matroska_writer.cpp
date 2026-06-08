@@ -1,6 +1,5 @@
 #include "core/matroska_writer.h"
 
-#include <array>
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
@@ -9,6 +8,7 @@
 #include <fstream>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -19,20 +19,9 @@
 #include "ebml/EbmlStream.h"
 #include "ebml/IOCallback.h"
 #include "ebml/StdIOCallback.h"
-#include "matroska/KaxCluster.h"
 #include "matroska/KaxContexts.h"
 #include "matroska/KaxSegment.h"
 #include "matroska/KaxTags.h"
-
-#ifdef _WIN32
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
-#endif
 
 namespace mte {
 namespace {
@@ -44,7 +33,6 @@ using libebml::IOCallback;
 using libebml::StdIOCallback;
 using libmatroska::Context_KaxMatroska;
 using libmatroska::Context_KaxSegment;
-using libmatroska::KaxCluster;
 using libmatroska::KaxSegment;
 using libmatroska::KaxTag;
 using libmatroska::KaxTagAttachmentUID;
@@ -84,9 +72,13 @@ constexpr std::uint64_t kTrackLanguageIetf = 0x22B59D;
 constexpr std::uint64_t kCodecId = 0x86;
 constexpr std::uint64_t kCodecName = 0x258688;
 constexpr std::uint64_t kCodecSettings = 0x3A9697;
+constexpr std::uint64_t kSeekHead = 0x114D9B74;
+constexpr std::uint64_t kVoid = 0xEC;
+constexpr std::uint64_t kSeek = 0x4DBB;
+constexpr std::uint64_t kSeekId = 0x53AB;
+constexpr std::uint64_t kSeekPosition = 0x53AC;
 constexpr std::uint64_t kTags = 0x1254C367;
 constexpr auto kMaxScanSize = std::numeric_limits<uint64>::max();
-constexpr std::size_t kCopyBufferSize = 1024 * 1024;
 
 struct Vint {
   std::uint64_t value = 0;
@@ -115,20 +107,23 @@ struct ElementInfo {
 
 struct SegmentLayout {
   SegmentHeader header;
-  std::uint64_t insert_offset = 0;
+  std::uint64_t file_size = 0;
+  std::uint64_t segment_end = 0;
   ElementInfo info;
   ElementInfo tracks;
   ElementInfo tags;
+  std::vector<ElementInfo> seek_heads;
+  std::vector<ElementInfo> voids;
   std::uint64_t tags_start = 0;
   std::uint64_t tags_end = 0;
   bool has_info = false;
   bool has_tracks = false;
   bool has_tags = false;
+  bool has_unknown_top_level = false;
 };
 
-struct Replacement {
+struct PlannedElementWrite {
   std::uint64_t start = 0;
-  std::uint64_t end = 0;
   std::vector<std::uint8_t> bytes;
 };
 
@@ -405,23 +400,22 @@ void skip_element(IOCallback& input, const EbmlElement& element) {
 SegmentLayout read_segment_layout(const std::filesystem::path& path) {
   SegmentLayout layout;
   layout.header = find_segment_header(path);
-  layout.insert_offset = layout.header.size_unknown
-                             ? std::numeric_limits<std::uint64_t>::max()
-                             : layout.header.data_start + layout.header.size_value;
-
+  layout.file_size = static_cast<std::uint64_t>(std::filesystem::file_size(path));
+  layout.segment_end = layout.header.size_unknown
+                           ? layout.file_size
+                           : layout.header.data_start + layout.header.size_value;
+  if (layout.segment_end > layout.file_size) {
+    throw std::runtime_error("The Matroska Segment extends beyond the end of the file.");
+  }
   std::ifstream input(path, std::ios::binary);
   if (!input) {
     throw std::runtime_error("Failed to open Matroska file.");
   }
 
-  const auto file_size = static_cast<std::uint64_t>(std::filesystem::file_size(path));
-  const auto segment_end = layout.header.size_unknown
-                               ? file_size
-                               : layout.header.data_start + layout.header.size_value;
   auto offset = layout.header.data_start;
-  while (offset < segment_end) {
+  while (offset < layout.segment_end) {
     input.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
-    const auto child = read_element(input, segment_end);
+    const auto child = read_element(input, layout.segment_end);
 
     if (child.id == kInfo) {
       layout.has_info = true;
@@ -429,29 +423,22 @@ SegmentLayout read_segment_layout(const std::filesystem::path& path) {
     } else if (child.id == kTracks) {
       layout.has_tracks = true;
       layout.tracks = child;
+    } else if (child.id == kSeekHead) {
+      layout.seek_heads.push_back(child);
+    } else if (child.id == kVoid) {
+      layout.voids.push_back(child);
     } else if (child.id == kTags) {
       layout.has_tags = true;
       layout.tags = child;
       layout.tags_start = child.start;
       layout.tags_end = child.end;
-      layout.insert_offset = layout.tags_start;
-    } else if (child.id == 0x1F43B675 &&
-               layout.insert_offset == std::numeric_limits<std::uint64_t>::max()) {
-      layout.insert_offset = child.start;
-      break;
     }
 
     if (child.unknown_size) {
+      layout.has_unknown_top_level = true;
       break;
     }
     offset = child.end;
-  }
-
-  if (layout.insert_offset == std::numeric_limits<std::uint64_t>::max()) {
-    layout.insert_offset = layout.header.size_unknown
-                               ? static_cast<std::uint64_t>(
-                                     std::filesystem::file_size(path))
-                               : layout.header.data_start + layout.header.size_value;
   }
 
   return layout;
@@ -505,135 +492,326 @@ std::vector<std::uint8_t> read_range_bytes(const std::filesystem::path& path,
   return bytes;
 }
 
-void copy_range(std::ifstream& input,
-                std::ofstream& output,
-                std::uint64_t start,
-                std::uint64_t end) {
-  if (end < start) {
-    throw std::runtime_error("Invalid file copy range.");
+std::uint64_t decode_ebml_id_payload(const std::vector<std::uint8_t>& payload) {
+  if (payload.empty() || payload.size() > 4) {
+    throw std::runtime_error("Invalid EBML SeekID payload.");
   }
 
-  input.seekg(static_cast<std::streamoff>(start), std::ios::beg);
-  std::array<char, kCopyBufferSize> buffer{};
-  auto remaining = end - start;
-  while (remaining > 0) {
-    const auto chunk =
-        static_cast<std::streamsize>(std::min<std::uint64_t>(remaining, buffer.size()));
-    input.read(buffer.data(), chunk);
-    if (input.gcount() != chunk) {
-      throw std::runtime_error("Failed to read Matroska file while saving.");
+  std::uint64_t value = 0;
+  for (const auto byte : payload) {
+    value = (value << 8) | byte;
+  }
+  return value;
+}
+
+bool seek_entry_targets_id(const std::filesystem::path& path,
+                           const ElementInfo& seek,
+                           std::uint64_t target_id) {
+  std::ifstream input(path, std::ios::binary);
+  if (!input) {
+    throw std::runtime_error("Failed to open Matroska file for SeekHead parsing.");
+  }
+
+  auto offset = seek.data_start;
+  while (offset < seek.end) {
+    input.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+    const auto child = read_element(input, seek.end);
+    if (child.id == kSeekId) {
+      return decode_ebml_id_payload(read_range_bytes(path, child.data_start, child.end)) ==
+             target_id;
     }
-    output.write(buffer.data(), chunk);
-    if (!output) {
-      throw std::runtime_error("Failed to write temporary Matroska file.");
+    if (child.unknown_size) {
+      break;
     }
-    remaining -= static_cast<std::uint64_t>(chunk);
+    offset = child.end;
+  }
+  return false;
+}
+
+bool seek_heads_reference_tags(const std::filesystem::path& path,
+                               const SegmentLayout& layout) {
+  for (const auto& seek_head : layout.seek_heads) {
+    auto offset = seek_head.data_start;
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+      throw std::runtime_error("Failed to open Matroska file for SeekHead parsing.");
+    }
+    while (offset < seek_head.end) {
+      input.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+      const auto child = read_element(input, seek_head.end);
+      if (child.id == kSeek && seek_entry_targets_id(path, child, kTags)) {
+        return true;
+      }
+      if (child.unknown_size) {
+        break;
+      }
+      offset = child.end;
+    }
+  }
+  return false;
+}
+
+std::vector<std::uint8_t> render_seek_entry(std::uint64_t id,
+                                            std::uint64_t relative_position) {
+  std::vector<std::uint8_t> payload;
+  append_bytes(payload, render_element(kSeekId, encode_id(id)));
+  append_bytes(payload, render_uint_element(kSeekPosition, relative_position));
+  return render_element(kSeek, payload);
+}
+
+std::vector<std::uint8_t> render_updated_seek_head(const std::filesystem::path& path,
+                                                   const ElementInfo& seek_head,
+                                                   std::uint64_t tags_relative_position) {
+  std::vector<std::uint8_t> payload;
+  std::ifstream input(path, std::ios::binary);
+  if (!input) {
+    throw std::runtime_error("Failed to open Matroska file for SeekHead parsing.");
+  }
+
+  auto offset = seek_head.data_start;
+  while (offset < seek_head.end) {
+    input.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+    const auto child = read_element(input, seek_head.end);
+    if (child.id != kSeek || !seek_entry_targets_id(path, child, kTags)) {
+      append_bytes(payload, read_range_bytes(path, child.start, child.end));
+    }
+    if (child.unknown_size) {
+      break;
+    }
+    offset = child.end;
+  }
+
+  append_bytes(payload, render_seek_entry(kTags, tags_relative_position));
+  return render_element(kSeekHead, payload);
+}
+
+bool bytes_fit_with_void(const std::vector<std::uint8_t>& bytes,
+                         std::uint64_t target_size) {
+  const auto byte_size = static_cast<std::uint64_t>(bytes.size());
+  if (byte_size > target_size) {
+    return false;
+  }
+  return target_size - byte_size != 1;
+}
+
+std::vector<std::uint8_t> pad_with_void(const std::vector<std::uint8_t>& bytes,
+                                        std::uint64_t target_size) {
+  if (!bytes_fit_with_void(bytes, target_size)) {
+    throw std::runtime_error("Matroska element does not fit the available space.");
+  }
+
+  std::vector<std::uint8_t> result = bytes;
+  const auto leftover = target_size - static_cast<std::uint64_t>(bytes.size());
+  if (leftover > 0) {
+    append_bytes(result, make_void(leftover));
+  }
+  return result;
+}
+
+std::optional<PlannedElementWrite> plan_seek_head_update(
+    const std::filesystem::path& path,
+    const SegmentLayout& layout,
+    std::uint64_t tags_start) {
+  if (layout.seek_heads.empty()) {
+    return std::nullopt;
+  }
+
+  const auto tags_relative_position = tags_start - layout.header.data_start;
+  for (const auto& seek_head : layout.seek_heads) {
+    if (seek_head.unknown_size) {
+      continue;
+    }
+    const auto updated = render_updated_seek_head(path, seek_head, tags_relative_position);
+    const auto old_size = seek_head.end - seek_head.start;
+    if (!bytes_fit_with_void(updated, old_size)) {
+      continue;
+    }
+    return PlannedElementWrite{seek_head.start, pad_with_void(updated, old_size)};
+  }
+
+  return std::nullopt;
+}
+
+std::optional<PlannedElementWrite> plan_void_tags_write(
+    const SegmentLayout& layout,
+    const std::vector<std::uint8_t>& tags_bytes) {
+  const ElementInfo* best_void = nullptr;
+  auto best_size = std::numeric_limits<std::uint64_t>::max();
+  for (const auto& void_element : layout.voids) {
+    const auto void_size = void_element.end - void_element.start;
+    if (void_size < best_size && bytes_fit_with_void(tags_bytes, void_size)) {
+      best_void = &void_element;
+      best_size = void_size;
+    }
+  }
+
+  if (!best_void) {
+    return std::nullopt;
+  }
+  return PlannedElementWrite{best_void->start, pad_with_void(tags_bytes, best_size)};
+}
+
+void write_bytes_at(std::fstream& file,
+                    std::uint64_t offset,
+                    const std::vector<std::uint8_t>& bytes,
+                    const char* description) {
+  file.clear();
+  file.seekp(static_cast<std::streamoff>(offset), std::ios::beg);
+  if (!file) {
+    throw std::runtime_error(std::string("Failed to seek while writing ") + description + ".");
+  }
+  if (!bytes.empty()) {
+    file.write(reinterpret_cast<const char*>(bytes.data()),
+               static_cast<std::streamsize>(bytes.size()));
+  }
+  if (!file) {
+    throw std::runtime_error(std::string("Failed to write ") + description + ".");
   }
 }
 
-void replace_file(const std::filesystem::path& source, const std::filesystem::path& target) {
-#ifdef _WIN32
-  if (!MoveFileExW(source.wstring().c_str(), target.wstring().c_str(),
-                   MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-    throw std::runtime_error("Failed to replace original Matroska file.");
+void append_file_bytes(std::fstream& file,
+                       const std::vector<std::uint8_t>& bytes) {
+  file.clear();
+  file.seekp(0, std::ios::end);
+  if (!file) {
+    throw std::runtime_error("Failed to seek to the end of the Matroska file.");
   }
-#else
-  std::filesystem::rename(source, target);
-#endif
+  file.write(reinterpret_cast<const char*>(bytes.data()),
+             static_cast<std::streamsize>(bytes.size()));
+  if (!file) {
+    throw std::runtime_error("Failed to append Matroska tags.");
+  }
 }
 
-std::filesystem::path temp_save_path(const std::filesystem::path& path) {
-  return path.parent_path() /
-         (path.filename().string() + ".matroska-tags-editor.tmp");
+std::vector<std::uint8_t> plan_segment_size_after_append(const SegmentLayout& layout,
+                                                         std::uint64_t appended_size) {
+  if (layout.header.size_unknown || appended_size == 0) {
+    return {};
+  }
+
+  return encode_size_vint(layout.header.size_value + appended_size,
+                          layout.header.size_length);
 }
 
-void write_modified_file(const TagDocument& document,
-                         const SegmentLayout& layout,
-                         std::vector<Replacement> replacements) {
-  const auto source_size = std::filesystem::file_size(document.path);
-  const auto temp_path = temp_save_path(document.path);
-
-  std::ifstream input(document.path, std::ios::binary);
-  std::ofstream output(temp_path, std::ios::binary | std::ios::trunc);
-  if (!input || !output) {
-    throw std::runtime_error("Failed to open files for Matroska save.");
+void write_segment_size(std::fstream& file,
+                        const SegmentLayout& layout,
+                        const std::vector<std::uint8_t>& updated_size) {
+  if (updated_size.empty()) {
+    return;
   }
-
-  std::sort(replacements.begin(), replacements.end(),
-            [](const Replacement& left, const Replacement& right) {
-              return left.start < right.start;
-            });
-
-  std::uint64_t delta = 0;
-  for (const auto& replacement : replacements) {
-    if (replacement.end < replacement.start) {
-      throw std::runtime_error("Invalid Matroska replacement range.");
-    }
-    const auto old_size = replacement.end - replacement.start;
-    const auto new_size = static_cast<std::uint64_t>(replacement.bytes.size());
-    if (new_size > old_size) {
-      delta += new_size - old_size;
-    }
-  }
-
-  std::vector<std::uint8_t> updated_segment_size;
-  if (delta > 0 && !layout.header.size_unknown) {
-    updated_segment_size =
-        encode_size_vint(layout.header.size_value + delta, layout.header.size_length);
-  }
-
-  auto cursor = std::uint64_t{0};
-  if (updated_segment_size.empty()) {
-    cursor = 0;
-  } else {
-    copy_range(input, output, 0, layout.header.size_offset);
-    output.write(reinterpret_cast<const char*>(updated_segment_size.data()),
-                 static_cast<std::streamsize>(updated_segment_size.size()));
-    cursor = layout.header.size_offset + layout.header.size_length;
-  }
-
-  for (const auto& replacement : replacements) {
-    if (replacement.start < cursor) {
-      throw std::runtime_error("Matroska replacement ranges overlap.");
-    }
-    copy_range(input, output, cursor, replacement.start);
-    output.write(reinterpret_cast<const char*>(replacement.bytes.data()),
-                 static_cast<std::streamsize>(replacement.bytes.size()));
-    cursor = replacement.end;
-  }
-
-  copy_range(input, output, cursor, source_size);
-  output.close();
-  input.close();
-
-  replace_file(temp_path, document.path);
+  write_bytes_at(file, layout.header.size_offset, updated_size, "Segment size");
 }
 
-Replacement make_tags_replacement(const SegmentLayout& layout,
-                                  const std::vector<std::uint8_t>& tags_bytes) {
-  Replacement replacement;
-  replacement.start = layout.insert_offset;
-  replacement.end = layout.insert_offset;
-  if (layout.has_tags) {
-    replacement.start = layout.tags_start;
-    replacement.end = layout.tags_end;
+std::vector<std::uint8_t> plan_old_tags_void(const SegmentLayout& layout) {
+  if (!layout.has_tags) {
+    return {};
   }
-  replacement.bytes = tags_bytes;
-
-  const auto old_size = replacement.end - replacement.start;
-  const auto new_size = static_cast<std::uint64_t>(replacement.bytes.size());
-  if (old_size > new_size) {
-    append_bytes(replacement.bytes, make_void(old_size - new_size));
-  }
-  return replacement;
+  return make_void(layout.tags_end - layout.tags_start);
 }
 
-std::vector<Replacement> make_replacements(const TagDocument& document,
-                                           const SegmentLayout& layout,
-                                           const std::vector<std::uint8_t>& tags_bytes) {
-  std::vector<Replacement> replacements;
-  replacements.push_back(make_tags_replacement(layout, tags_bytes));
-  return replacements;
+void void_existing_tags(std::fstream& file,
+                        const SegmentLayout& layout,
+                        const std::vector<std::uint8_t>& void_bytes) {
+  if (void_bytes.empty()) {
+    return;
+  }
+  write_bytes_at(file, layout.tags_start, void_bytes, "old Matroska Tags");
+}
+
+bool try_write_tags_in_existing_place(std::fstream& file,
+                                      const SegmentLayout& layout,
+                                      const std::vector<std::uint8_t>& tags_bytes) {
+  if (!layout.has_tags) {
+    return false;
+  }
+
+  const auto old_size = layout.tags_end - layout.tags_start;
+  if (!bytes_fit_with_void(tags_bytes, old_size)) {
+    return false;
+  }
+
+  write_bytes_at(file, layout.tags_start, pad_with_void(tags_bytes, old_size),
+                 "Matroska Tags");
+  return true;
+}
+
+bool try_write_tags_to_void(const std::filesystem::path& path,
+                            std::fstream& file,
+                            const SegmentLayout& layout,
+                            const std::vector<std::uint8_t>& tags_bytes) {
+  const auto planned_tags = plan_void_tags_write(layout, tags_bytes);
+  if (!planned_tags.has_value()) {
+    return false;
+  }
+
+  const auto seek_head_update =
+      plan_seek_head_update(path, layout, planned_tags->start);
+  if (layout.has_tags && seek_heads_reference_tags(path, layout) &&
+      !seek_head_update.has_value()) {
+    throw std::runtime_error(
+        "Cannot move Matroska Tags without rewriting because the existing SeekHead "
+        "does not have enough room for the updated Tags position.");
+  }
+  const auto old_tags_void = plan_old_tags_void(layout);
+
+  write_bytes_at(file, planned_tags->start, planned_tags->bytes, "Matroska Tags");
+  if (seek_head_update.has_value()) {
+    write_bytes_at(file, seek_head_update->start, seek_head_update->bytes, "SeekHead");
+  }
+  void_existing_tags(file, layout, old_tags_void);
+  return true;
+}
+
+void append_tags_to_segment(const std::filesystem::path& path,
+                            std::fstream& file,
+                            const SegmentLayout& layout,
+                            const std::vector<std::uint8_t>& tags_bytes) {
+  if (layout.has_unknown_top_level) {
+    throw std::runtime_error(
+        "Cannot append Matroska Tags safely because the Segment contains an "
+        "unknown-sized top-level element.");
+  }
+  if (!layout.header.size_unknown && layout.segment_end != layout.file_size) {
+    throw std::runtime_error(
+        "Cannot append Matroska Tags without rewriting because the Segment does "
+        "not end at the end of the file.");
+  }
+
+  const auto tags_start = layout.file_size;
+  const auto seek_head_update = plan_seek_head_update(path, layout, tags_start);
+  if (layout.has_tags && seek_heads_reference_tags(path, layout) &&
+      !seek_head_update.has_value()) {
+    throw std::runtime_error(
+        "Cannot move Matroska Tags without rewriting because the existing SeekHead "
+        "does not have enough room for the updated Tags position.");
+  }
+  const auto segment_size =
+      plan_segment_size_after_append(layout, static_cast<std::uint64_t>(tags_bytes.size()));
+  const auto old_tags_void = plan_old_tags_void(layout);
+
+  append_file_bytes(file, tags_bytes);
+  write_segment_size(file, layout, segment_size);
+  if (seek_head_update.has_value()) {
+    write_bytes_at(file, seek_head_update->start, seek_head_update->bytes, "SeekHead");
+  }
+  void_existing_tags(file, layout, old_tags_void);
+}
+
+void write_tags_without_full_rewrite(const std::filesystem::path& path,
+                                     const SegmentLayout& layout,
+                                     const std::vector<std::uint8_t>& tags_bytes) {
+  std::fstream file(path, std::ios::binary | std::ios::in | std::ios::out);
+  if (!file) {
+    throw std::runtime_error("Failed to open Matroska file for metadata writing.");
+  }
+
+  if (try_write_tags_in_existing_place(file, layout, tags_bytes)) {
+    return;
+  }
+  if (try_write_tags_to_void(path, file, layout, tags_bytes)) {
+    return;
+  }
+  append_tags_to_segment(path, file, layout, tags_bytes);
 }
 
 }  // namespace
@@ -645,7 +823,7 @@ void save_tag_document(const TagDocument& document) {
 
   const auto tags_bytes = render_tags(document);
   const auto layout = read_segment_layout(document.path);
-  write_modified_file(document, layout, make_replacements(document, layout, tags_bytes));
+  write_tags_without_full_rewrite(document.path, layout, tags_bytes);
 }
 
 }  // namespace mte
