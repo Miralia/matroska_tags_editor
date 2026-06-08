@@ -127,10 +127,6 @@ std::string editable_display_text(const std::string& value) {
   return value.empty() ? "(Click to edit)" : value;
 }
 
-std::string editable_cell_text(const std::string& value, bool is_editing) {
-  return is_editing ? value : editable_display_text(value);
-}
-
 int inline_editor_height(int cell_height, int best_height, int vertical_padding) {
   return std::max(cell_height, best_height + vertical_padding);
 }
@@ -143,13 +139,9 @@ unsigned inline_edit_column_from_x(int x, int name_column_width) {
   return x < name_column_width ? 0 : 1;
 }
 
-unsigned inline_edit_event_column(int event_column,
-                                  bool has_active_edit,
-                                  unsigned active_column) {
-  if (event_column >= 0) {
-    return static_cast<unsigned>(event_column);
-  }
-  return has_active_edit ? active_column : 0;
+bool should_apply_inline_editor_value(const std::string& original,
+                                      const std::string& edited) {
+  return original != edited;
 }
 
 std::optional<std::filesystem::path> first_dropped_file_path(

@@ -99,17 +99,14 @@ bool is_hidden_extra_tag_name(const std::string& name);
 
 std::string editable_display_text(const std::string& value);
 
-std::string editable_cell_text(const std::string& value, bool is_editing);
-
 int inline_editor_height(int cell_height, int best_height, int vertical_padding);
 
 bool can_start_inline_edit(bool is_field, unsigned column, bool has_modifier);
 
 unsigned inline_edit_column_from_x(int x, int name_column_width);
 
-unsigned inline_edit_event_column(int event_column,
-                                  bool has_active_edit,
-                                  unsigned active_column);
+bool should_apply_inline_editor_value(const std::string& original,
+                                      const std::string& edited);
 
 std::optional<std::filesystem::path> first_dropped_file_path(
     const std::vector<std::filesystem::path>& paths);
