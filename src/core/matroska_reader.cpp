@@ -1,9 +1,11 @@
 #include "core/matroska_reader.h"
 
 #include <algorithm>
+#include <ctime>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -12,13 +14,27 @@ namespace mte {
 namespace {
 
 constexpr std::uint64_t kSegment = 0x18538067;
+constexpr std::uint64_t kInfo = 0x1549A966;
+constexpr std::uint64_t kDateUtc = 0x4461;
+constexpr std::uint64_t kTitle = 0x7BA9;
+constexpr std::uint64_t kMuxingApp = 0x4D80;
+constexpr std::uint64_t kWritingApp = 0x5741;
 constexpr std::uint64_t kTracks = 0x1654AE6B;
 constexpr std::uint64_t kTrackEntry = 0xAE;
 constexpr std::uint64_t kTrackNumber = 0xD7;
 constexpr std::uint64_t kTrackUid = 0x73C5;
 constexpr std::uint64_t kTrackType = 0x83;
+constexpr std::uint64_t kTrackFlagEnabled = 0xB9;
+constexpr std::uint64_t kTrackFlagDefault = 0x88;
+constexpr std::uint64_t kTrackFlagForced = 0x55AA;
+constexpr std::uint64_t kTrackFlagOriginal = 0x55AE;
+constexpr std::uint64_t kTrackFlagCommentary = 0x55AF;
 constexpr std::uint64_t kTrackName = 0x536E;
+constexpr std::uint64_t kTrackLanguage = 0x22B59C;
+constexpr std::uint64_t kTrackLanguageIetf = 0x22B59D;
 constexpr std::uint64_t kCodecId = 0x86;
+constexpr std::uint64_t kCodecName = 0x258688;
+constexpr std::uint64_t kCodecSettings = 0x3A9697;
 constexpr std::uint64_t kTags = 0x1254C367;
 constexpr std::uint64_t kTag = 0x7373;
 constexpr std::uint64_t kTargets = 0x63C0;
@@ -129,6 +145,48 @@ std::uint64_t read_uint(std::ifstream& input, const Element& element) {
   return value;
 }
 
+std::int64_t read_int(std::ifstream& input, const Element& element) {
+  if (element.data_size == 0 || element.data_size > 8) {
+    throw std::runtime_error("Matroska signed integer element has invalid size.");
+  }
+  input.seekg(static_cast<std::streamoff>(element.data_start), std::ios::beg);
+  std::uint64_t unsigned_value = 0;
+  for (std::uint64_t i = 0; i < element.data_size; ++i) {
+    const auto byte = input.get();
+    if (byte == EOF) {
+      throw std::runtime_error("Failed to read Matroska signed integer element.");
+    }
+    unsigned_value = (unsigned_value << 8) | static_cast<std::uint8_t>(byte);
+  }
+
+  const auto bits = element.data_size * 8;
+  const auto sign_bit = std::uint64_t{1} << (bits - 1);
+  if ((unsigned_value & sign_bit) == 0) {
+    return static_cast<std::int64_t>(unsigned_value);
+  }
+
+  const auto mask = bits == 64 ? std::uint64_t{0} : (~std::uint64_t{0} << bits);
+  return static_cast<std::int64_t>(unsigned_value | mask);
+}
+
+std::string format_matroska_date(std::int64_t nanoseconds_since_2001) {
+  constexpr std::int64_t kUnixToMatroskaEpochSeconds = 978307200;
+  const auto seconds =
+      kUnixToMatroskaEpochSeconds + nanoseconds_since_2001 / 1000000000;
+  const auto time = static_cast<std::time_t>(seconds);
+  std::tm utc{};
+#ifdef _WIN32
+  gmtime_s(&utc, &time);
+#else
+  gmtime_r(&time, &utc);
+#endif
+  char buffer[32]{};
+  if (std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S UTC", &utc) == 0) {
+    return {};
+  }
+  return buffer;
+}
+
 std::vector<std::uint8_t> read_binary(std::ifstream& input, const Element& element) {
   std::vector<std::uint8_t> value(static_cast<std::size_t>(element.data_size));
   if (value.empty()) {
@@ -140,6 +198,31 @@ std::vector<std::uint8_t> read_binary(std::ifstream& input, const Element& eleme
     throw std::runtime_error("Failed to read Matroska binary element.");
   }
   return value;
+}
+
+void parse_info(std::ifstream& input, const Element& info, TagDocument& document) {
+  auto offset = info.data_start;
+  while (offset < info.end) {
+    input.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+    const auto child = read_element(input, info.end);
+    switch (child.id) {
+      case kTitle:
+        document.info.title = read_string(input, child);
+        break;
+      case kDateUtc:
+        document.info.date_utc = format_matroska_date(read_int(input, child));
+        break;
+      case kMuxingApp:
+        document.info.muxing_app = read_string(input, child);
+        break;
+      case kWritingApp:
+        document.info.writing_app = read_string(input, child);
+        break;
+      default:
+        break;
+    }
+    offset = child.end;
+  }
 }
 
 TrackInfo parse_track(std::ifstream& input, const Element& entry) {
@@ -158,17 +241,45 @@ TrackInfo parse_track(std::ifstream& input, const Element& entry) {
       case kTrackType:
         track.type = read_uint(input, child);
         break;
+      case kTrackFlagEnabled:
+        track.flag_enabled = read_uint(input, child) != 0;
+        break;
+      case kTrackFlagDefault:
+        track.flag_default = read_uint(input, child) != 0;
+        break;
+      case kTrackFlagForced:
+        track.flag_forced = read_uint(input, child) != 0;
+        break;
+      case kTrackFlagOriginal:
+        track.flag_original = read_uint(input, child) != 0;
+        break;
+      case kTrackFlagCommentary:
+        track.flag_commentary = read_uint(input, child) != 0;
+        break;
       case kTrackName:
         track.name = read_string(input, child);
         break;
+      case kTrackLanguage:
+        track.language = read_string(input, child);
+        break;
+      case kTrackLanguageIetf:
+        track.language_bcp47 = read_string(input, child);
+        break;
       case kCodecId:
         track.codec_id = read_string(input, child);
+        break;
+      case kCodecName:
+        track.codec_name = read_string(input, child);
+        break;
+      case kCodecSettings:
+        track.codec_settings = read_string(input, child);
         break;
       default:
         break;
     }
     offset = child.end;
   }
+  track.original_uid = track.uid;
   return track;
 }
 
@@ -322,7 +433,9 @@ TagDocument load_tag_document(const std::filesystem::path& path) {
   while (offset < segment.end) {
     input.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
     const auto child = read_element(input, segment.end);
-    if (child.id == kTracks) {
+    if (child.id == kInfo) {
+      parse_info(input, child, document);
+    } else if (child.id == kTracks) {
       parse_tracks(input, child, document);
     } else if (child.id == kTags) {
       parse_tags(input, child, document);

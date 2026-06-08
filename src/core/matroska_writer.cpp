@@ -1,6 +1,7 @@
 #include "core/matroska_writer.h"
 
 #include <array>
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -24,6 +25,12 @@
 #include "matroska/KaxTags.h"
 
 #ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 #endif
 
@@ -57,6 +64,27 @@ using libmatroska::KaxTagTrackUID;
 using libmatroska::KaxTags;
 
 constexpr std::uint64_t kMatroskaSegmentId = 0x18538067;
+constexpr std::uint64_t kInfo = 0x1549A966;
+constexpr std::uint64_t kDateUtc = 0x4461;
+constexpr std::uint64_t kTitle = 0x7BA9;
+constexpr std::uint64_t kMuxingApp = 0x4D80;
+constexpr std::uint64_t kWritingApp = 0x5741;
+constexpr std::uint64_t kTracks = 0x1654AE6B;
+constexpr std::uint64_t kTrackEntry = 0xAE;
+constexpr std::uint64_t kTrackNumber = 0xD7;
+constexpr std::uint64_t kTrackUid = 0x73C5;
+constexpr std::uint64_t kTrackFlagEnabled = 0xB9;
+constexpr std::uint64_t kTrackFlagDefault = 0x88;
+constexpr std::uint64_t kTrackFlagForced = 0x55AA;
+constexpr std::uint64_t kTrackFlagOriginal = 0x55AE;
+constexpr std::uint64_t kTrackFlagCommentary = 0x55AF;
+constexpr std::uint64_t kTrackName = 0x536E;
+constexpr std::uint64_t kTrackLanguage = 0x22B59C;
+constexpr std::uint64_t kTrackLanguageIetf = 0x22B59D;
+constexpr std::uint64_t kCodecId = 0x86;
+constexpr std::uint64_t kCodecName = 0x258688;
+constexpr std::uint64_t kCodecSettings = 0x3A9697;
+constexpr std::uint64_t kTags = 0x1254C367;
 constexpr auto kMaxScanSize = std::numeric_limits<uint64>::max();
 constexpr std::size_t kCopyBufferSize = 1024 * 1024;
 
@@ -75,12 +103,33 @@ struct SegmentHeader {
   bool size_unknown = false;
 };
 
+struct ElementInfo {
+  std::uint64_t id = 0;
+  std::uint64_t start = 0;
+  std::uint64_t data_start = 0;
+  std::uint64_t data_size = 0;
+  std::uint64_t end = 0;
+  std::uint8_t size_length = 0;
+  bool unknown_size = false;
+};
+
 struct SegmentLayout {
   SegmentHeader header;
   std::uint64_t insert_offset = 0;
+  ElementInfo info;
+  ElementInfo tracks;
+  ElementInfo tags;
   std::uint64_t tags_start = 0;
   std::uint64_t tags_end = 0;
+  bool has_info = false;
+  bool has_tracks = false;
   bool has_tags = false;
+};
+
+struct Replacement {
+  std::uint64_t start = 0;
+  std::uint64_t end = 0;
+  std::vector<std::uint8_t> bytes;
 };
 
 template <typename T>
@@ -228,6 +277,18 @@ Vint read_vint(std::ifstream& input, bool keep_marker) {
   return {value, length, all_ones};
 }
 
+ElementInfo read_element(std::ifstream& input, std::uint64_t container_end) {
+  const auto start = static_cast<std::uint64_t>(input.tellg());
+  const auto id = read_vint(input, true);
+  const auto size = read_vint(input, false);
+  const auto data_start = static_cast<std::uint64_t>(input.tellg());
+  const auto end = size.unknown ? container_end : data_start + size.value;
+  if (end > container_end) {
+    throw std::runtime_error("EBML element exceeds its containing element.");
+  }
+  return {id.value, start, data_start, size.value, end, size.length, size.unknown};
+}
+
 std::vector<std::uint8_t> encode_size_vint(std::uint64_t value, std::uint8_t length) {
   if (length == 0 || length > 8) {
     throw std::runtime_error("Invalid EBML size length.");
@@ -246,6 +307,67 @@ std::vector<std::uint8_t> encode_size_vint(std::uint64_t value, std::uint8_t len
   }
   bytes[0] |= static_cast<std::uint8_t>(0x80 >> (length - 1));
   return bytes;
+}
+
+std::vector<std::uint8_t> encode_id(std::uint64_t id) {
+  std::uint8_t length = 1;
+  if (id > 0xFFFFFF) {
+    length = 4;
+  } else if (id > 0xFFFF) {
+    length = 3;
+  } else if (id > 0xFF) {
+    length = 2;
+  }
+
+  std::vector<std::uint8_t> bytes(length);
+  for (std::uint8_t i = 0; i < length; ++i) {
+    const auto shift = 8 * (length - i - 1);
+    bytes[i] = static_cast<std::uint8_t>((id >> shift) & 0xFF);
+  }
+  return bytes;
+}
+
+std::uint8_t size_vint_length(std::uint64_t value) {
+  for (std::uint8_t length = 1; length <= 8; ++length) {
+    const auto max_value = (length == 8) ? ((std::uint64_t{1} << 56) - 2)
+                                        : ((std::uint64_t{1} << (7 * length)) - 2);
+    if (value <= max_value) {
+      return length;
+    }
+  }
+  throw std::runtime_error("EBML element is too large.");
+}
+
+void append_bytes(std::vector<std::uint8_t>& target,
+                  const std::vector<std::uint8_t>& source) {
+  target.insert(target.end(), source.begin(), source.end());
+}
+
+std::vector<std::uint8_t> render_element(std::uint64_t id,
+                                         const std::vector<std::uint8_t>& payload) {
+  std::vector<std::uint8_t> bytes;
+  append_bytes(bytes, encode_id(id));
+  append_bytes(bytes, encode_size_vint(payload.size(), size_vint_length(payload.size())));
+  append_bytes(bytes, payload);
+  return bytes;
+}
+
+std::vector<std::uint8_t> render_string_element(std::uint64_t id,
+                                                const std::string& value) {
+  return render_element(id, {value.begin(), value.end()});
+}
+
+std::vector<std::uint8_t> render_uint_element(std::uint64_t id, std::uint64_t value) {
+  std::vector<std::uint8_t> payload;
+  bool started = false;
+  for (int shift = 56; shift >= 0; shift -= 8) {
+    const auto byte = static_cast<std::uint8_t>((value >> shift) & 0xFF);
+    if (byte != 0 || started || shift == 0) {
+      started = true;
+      payload.push_back(byte);
+    }
+  }
+  return render_element(id, payload);
 }
 
 SegmentHeader find_segment_header(const std::filesystem::path& path) {
@@ -287,46 +409,42 @@ SegmentLayout read_segment_layout(const std::filesystem::path& path) {
                              ? std::numeric_limits<std::uint64_t>::max()
                              : layout.header.data_start + layout.header.size_value;
 
-  StdIOCallback input(path.string().c_str(), MODE_READ);
-  input.setFilePointer(layout.header.element_start, libebml::seek_beginning);
-  EbmlStream stream(input);
-  int upper_level = 0;
-  std::unique_ptr<EbmlElement> segment_element(
-      stream.FindNextElement(Context_KaxMatroska, upper_level, kMaxScanSize, true));
-  auto* segment = dynamic_cast<KaxSegment*>(segment_element.get());
-  if (!segment) {
-    throw std::runtime_error("No Matroska segment was found in the file.");
+  std::ifstream input(path, std::ios::binary);
+  if (!input) {
+    throw std::runtime_error("Failed to open Matroska file.");
   }
 
-  const auto segment_end = segment->IsFiniteSize()
-                               ? segment->GetEndPosition()
-                               : std::numeric_limits<uint64>::max();
-  input.setFilePointer(segment->GetDataStart(), libebml::seek_beginning);
-  EbmlStream segment_stream(input);
+  const auto file_size = static_cast<std::uint64_t>(std::filesystem::file_size(path));
+  const auto segment_end = layout.header.size_unknown
+                               ? file_size
+                               : layout.header.data_start + layout.header.size_value;
+  auto offset = layout.header.data_start;
+  while (offset < segment_end) {
+    input.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+    const auto child = read_element(input, segment_end);
 
-  while (input.getFilePointer() < segment_end) {
-    int child_upper = 0;
-    std::unique_ptr<EbmlElement> child(segment_stream.FindNextElement(
-        Context_KaxSegment, child_upper, kMaxScanSize, true));
-    if (!child || child_upper > 0) {
-      break;
-    }
-
-    if (dynamic_cast<KaxTags*>(child.get())) {
+    if (child.id == kInfo) {
+      layout.has_info = true;
+      layout.info = child;
+    } else if (child.id == kTracks) {
+      layout.has_tracks = true;
+      layout.tracks = child;
+    } else if (child.id == kTags) {
       layout.has_tags = true;
-      layout.tags_start = child->GetElementPosition();
-      layout.tags_end = child->GetEndPosition();
+      layout.tags = child;
+      layout.tags_start = child.start;
+      layout.tags_end = child.end;
       layout.insert_offset = layout.tags_start;
+    } else if (child.id == 0x1F43B675 &&
+               layout.insert_offset == std::numeric_limits<std::uint64_t>::max()) {
+      layout.insert_offset = child.start;
       break;
     }
 
-    if (dynamic_cast<KaxCluster*>(child.get()) &&
-        layout.insert_offset == std::numeric_limits<std::uint64_t>::max()) {
-      layout.insert_offset = child->GetElementPosition();
+    if (child.unknown_size) {
       break;
     }
-
-    skip_element(input, *child);
+    offset = child.end;
   }
 
   if (layout.insert_offset == std::numeric_limits<std::uint64_t>::max()) {
@@ -366,6 +484,25 @@ std::vector<std::uint8_t> make_void(std::uint64_t size) {
   }
 
   throw std::runtime_error("Cannot create EBML Void filler for the requested size.");
+}
+
+std::vector<std::uint8_t> read_range_bytes(const std::filesystem::path& path,
+                                           std::uint64_t start,
+                                           std::uint64_t end) {
+  std::ifstream input(path, std::ios::binary);
+  if (!input) {
+    throw std::runtime_error("Failed to open Matroska file for reading.");
+  }
+  input.seekg(static_cast<std::streamoff>(start), std::ios::beg);
+  std::vector<std::uint8_t> bytes(static_cast<std::size_t>(end - start));
+  if (!bytes.empty()) {
+    input.read(reinterpret_cast<char*>(bytes.data()),
+               static_cast<std::streamsize>(bytes.size()));
+    if (!input) {
+      throw std::runtime_error("Failed to read Matroska element bytes.");
+    }
+  }
+  return bytes;
 }
 
 void copy_range(std::ifstream& input,
@@ -412,7 +549,7 @@ std::filesystem::path temp_save_path(const std::filesystem::path& path) {
 
 void write_modified_file(const TagDocument& document,
                          const SegmentLayout& layout,
-                         const std::vector<std::uint8_t>& tags_bytes) {
+                         std::vector<Replacement> replacements) {
   const auto source_size = std::filesystem::file_size(document.path);
   const auto temp_path = temp_save_path(document.path);
 
@@ -422,48 +559,81 @@ void write_modified_file(const TagDocument& document,
     throw std::runtime_error("Failed to open files for Matroska save.");
   }
 
-  std::uint64_t replaced_start = layout.insert_offset;
-  std::uint64_t replaced_end = layout.insert_offset;
-  if (layout.has_tags) {
-    replaced_start = layout.tags_start;
-    replaced_end = layout.tags_end;
+  std::sort(replacements.begin(), replacements.end(),
+            [](const Replacement& left, const Replacement& right) {
+              return left.start < right.start;
+            });
+
+  std::uint64_t delta = 0;
+  for (const auto& replacement : replacements) {
+    if (replacement.end < replacement.start) {
+      throw std::runtime_error("Invalid Matroska replacement range.");
+    }
+    const auto old_size = replacement.end - replacement.start;
+    const auto new_size = static_cast<std::uint64_t>(replacement.bytes.size());
+    if (new_size > old_size) {
+      delta += new_size - old_size;
+    }
   }
 
-  const auto old_size = replaced_end - replaced_start;
-  const auto new_size = static_cast<std::uint64_t>(tags_bytes.size());
-  const auto grows = new_size > old_size;
-  const auto delta = grows ? new_size - old_size : 0;
-
   std::vector<std::uint8_t> updated_segment_size;
-  if (grows && !layout.header.size_unknown) {
+  if (delta > 0 && !layout.header.size_unknown) {
     updated_segment_size =
         encode_size_vint(layout.header.size_value + delta, layout.header.size_length);
   }
 
+  auto cursor = std::uint64_t{0};
   if (updated_segment_size.empty()) {
-    copy_range(input, output, 0, replaced_start);
+    cursor = 0;
   } else {
     copy_range(input, output, 0, layout.header.size_offset);
     output.write(reinterpret_cast<const char*>(updated_segment_size.data()),
                  static_cast<std::streamsize>(updated_segment_size.size()));
-    copy_range(input, output, layout.header.size_offset + layout.header.size_length,
-               replaced_start);
+    cursor = layout.header.size_offset + layout.header.size_length;
   }
 
-  output.write(reinterpret_cast<const char*>(tags_bytes.data()),
-               static_cast<std::streamsize>(tags_bytes.size()));
-
-  if (old_size > new_size) {
-    const auto filler = make_void(old_size - new_size);
-    output.write(reinterpret_cast<const char*>(filler.data()),
-                 static_cast<std::streamsize>(filler.size()));
+  for (const auto& replacement : replacements) {
+    if (replacement.start < cursor) {
+      throw std::runtime_error("Matroska replacement ranges overlap.");
+    }
+    copy_range(input, output, cursor, replacement.start);
+    output.write(reinterpret_cast<const char*>(replacement.bytes.data()),
+                 static_cast<std::streamsize>(replacement.bytes.size()));
+    cursor = replacement.end;
   }
 
-  copy_range(input, output, replaced_end, source_size);
+  copy_range(input, output, cursor, source_size);
   output.close();
   input.close();
 
   replace_file(temp_path, document.path);
+}
+
+Replacement make_tags_replacement(const SegmentLayout& layout,
+                                  const std::vector<std::uint8_t>& tags_bytes) {
+  Replacement replacement;
+  replacement.start = layout.insert_offset;
+  replacement.end = layout.insert_offset;
+  if (layout.has_tags) {
+    replacement.start = layout.tags_start;
+    replacement.end = layout.tags_end;
+  }
+  replacement.bytes = tags_bytes;
+
+  const auto old_size = replacement.end - replacement.start;
+  const auto new_size = static_cast<std::uint64_t>(replacement.bytes.size());
+  if (old_size > new_size) {
+    append_bytes(replacement.bytes, make_void(old_size - new_size));
+  }
+  return replacement;
+}
+
+std::vector<Replacement> make_replacements(const TagDocument& document,
+                                           const SegmentLayout& layout,
+                                           const std::vector<std::uint8_t>& tags_bytes) {
+  std::vector<Replacement> replacements;
+  replacements.push_back(make_tags_replacement(layout, tags_bytes));
+  return replacements;
 }
 
 }  // namespace
@@ -475,7 +645,7 @@ void save_tag_document(const TagDocument& document) {
 
   const auto tags_bytes = render_tags(document);
   const auto layout = read_segment_layout(document.path);
-  write_modified_file(document, layout, tags_bytes);
+  write_modified_file(document, layout, make_replacements(document, layout, tags_bytes));
 }
 
 }  // namespace mte
