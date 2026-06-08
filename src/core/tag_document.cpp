@@ -144,6 +144,16 @@ bool should_apply_inline_editor_value(const std::string& original,
   return original != edited;
 }
 
+InlineEditorPosition inline_editor_parent_position(int rect_x,
+                                                   int rect_y,
+                                                   int tree_screen_x,
+                                                   int tree_screen_y,
+                                                   int parent_screen_x,
+                                                   int parent_screen_y) {
+  return {rect_x + tree_screen_x - parent_screen_x,
+          rect_y + tree_screen_y - parent_screen_y};
+}
+
 std::optional<std::filesystem::path> first_dropped_file_path(
     const std::vector<std::filesystem::path>& paths) {
   for (const auto& path : paths) {

@@ -92,6 +92,11 @@ struct EditableField {
   std::vector<std::size_t> simple_path;
 };
 
+struct InlineEditorPosition {
+  int x = 0;
+  int y = 0;
+};
+
 std::string describe_targets(const TagTargets& targets,
                              const std::vector<TrackInfo>& tracks);
 
@@ -107,6 +112,13 @@ unsigned inline_edit_column_from_x(int x, int name_column_width);
 
 bool should_apply_inline_editor_value(const std::string& original,
                                       const std::string& edited);
+
+InlineEditorPosition inline_editor_parent_position(int rect_x,
+                                                   int rect_y,
+                                                   int tree_screen_x,
+                                                   int tree_screen_y,
+                                                   int parent_screen_x,
+                                                   int parent_screen_y);
 
 std::optional<std::filesystem::path> first_dropped_file_path(
     const std::vector<std::filesystem::path>& paths);

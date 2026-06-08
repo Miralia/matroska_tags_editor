@@ -1051,6 +1051,16 @@ class MainFrame final : public wxFrame {
     DestroyInlineEditor();
 
     rect.Deflate(1, 1);
+    const auto tree_screen = tree_->ClientToScreen(wxPoint(0, 0));
+    const auto parent_screen = editor_parent->ClientToScreen(wxPoint(0, 0));
+    const auto editor_position =
+        mte::inline_editor_parent_position(rect.x,
+                                           rect.y,
+                                           tree_screen.x,
+                                           tree_screen.y,
+                                           parent_screen.x,
+                                           parent_screen.y);
+    rect.SetPosition(wxPoint(editor_position.x, editor_position.y));
     const auto text = model_->TextForItemColumn(item, column);
     inline_editor_item_ = item;
     inline_editor_column_ = column;
