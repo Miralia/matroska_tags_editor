@@ -123,6 +123,10 @@ bool is_hidden_extra_tag_name(const std::string& name) {
          normalized == "_STATISTICS_TAGS";
 }
 
+std::string editable_display_text(const std::string& value) {
+  return value.empty() ? "(Click to edit)" : value;
+}
+
 std::vector<EditableField> editable_fields(const TagDocument& document) {
   std::vector<EditableField> fields;
   for (std::size_t tag_index = 0; tag_index < document.tags.size(); ++tag_index) {

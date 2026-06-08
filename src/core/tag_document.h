@@ -97,6 +97,8 @@ std::string describe_targets(const TagTargets& targets,
 
 bool is_hidden_extra_tag_name(const std::string& name);
 
+std::string editable_display_text(const std::string& value);
+
 std::vector<EditableTarget> editable_targets(const TagDocument& document);
 
 EditableField add_extra_tag(TagDocument& document,

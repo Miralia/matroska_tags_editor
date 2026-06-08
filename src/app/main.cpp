@@ -5,11 +5,11 @@
 #include <wx/msgdlg.h>
 #include <wx/sizer.h>
 #include <wx/textctrl.h>
-#include <wx/treelist.h>
 #include <wx/wx.h>
 
 #include <algorithm>
 #include <filesystem>
+#include <memory>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -46,8 +46,7 @@ enum class ItemKind {
   Field
 };
 
-class ItemData final : public wxClientData {
- public:
+struct ItemData {
   ItemKind kind = ItemKind::Group;
   mte::EditableTarget target;
   std::size_t tag_index = 0;
@@ -171,6 +170,199 @@ struct InlineEditRequest {
   unsigned column = 0;
 };
 
+struct ViewNode {
+  ItemData data;
+  std::string label;
+  std::string name;
+  std::string value;
+  ViewNode* parent = nullptr;
+  std::vector<std::unique_ptr<ViewNode>> children;
+};
+
+class TagTreeModel final : public wxDataViewModel {
+ public:
+  unsigned int GetColumnCount() const override {
+    return 2;
+  }
+
+  wxString GetColumnType(unsigned int) const override {
+    return "string";
+  }
+
+  void GetValue(wxVariant& variant,
+                const wxDataViewItem& item,
+                unsigned int column) const override {
+    const auto* node = NodeFromItem(item);
+    if (!node) {
+      variant = "";
+      return;
+    }
+
+    if (node->data.kind == ItemKind::Group) {
+      variant = column == 0 ? wxString::FromUTF8(node->label) : wxString();
+      return;
+    }
+
+    variant = wxString::FromUTF8(
+        mte::editable_display_text(column == 0 ? node->name : node->value));
+  }
+
+  bool SetValue(const wxVariant&, const wxDataViewItem&, unsigned int) override {
+    return false;
+  }
+
+  bool GetAttr(const wxDataViewItem& item,
+               unsigned int column,
+               wxDataViewItemAttr& attr) const override {
+    const auto* node = NodeFromItem(item);
+    if (!node) {
+      return false;
+    }
+
+    if (node->data.kind == ItemKind::Group && column == 0) {
+      attr.SetBold(true);
+      return true;
+    }
+
+    if (node->data.kind == ItemKind::Field &&
+        ((column == 0 && node->name.empty()) ||
+         (column == 1 && node->value.empty()))) {
+      attr.SetColour(wxColour(128, 128, 128));
+      attr.SetItalic(true);
+      return true;
+    }
+
+    return false;
+  }
+
+  wxDataViewItem GetParent(const wxDataViewItem& item) const override {
+    const auto* node = NodeFromItem(item);
+    if (!node || !node->parent) {
+      return wxDataViewItem();
+    }
+    return ItemFromNode(node->parent);
+  }
+
+  bool IsContainer(const wxDataViewItem& item) const override {
+    if (!item.IsOk()) {
+      return true;
+    }
+    const auto* node = NodeFromItem(item);
+    return node && node->data.kind == ItemKind::Group;
+  }
+
+  unsigned int GetChildren(const wxDataViewItem& item,
+                           wxDataViewItemArray& children) const override {
+    if (!item.IsOk()) {
+      for (const auto& root : roots_) {
+        children.Add(ItemFromNode(root.get()));
+      }
+      return static_cast<unsigned int>(roots_.size());
+    }
+
+    const auto* node = NodeFromItem(item);
+    if (!node) {
+      return 0;
+    }
+
+    for (const auto& child : node->children) {
+      children.Add(ItemFromNode(child.get()));
+    }
+    return static_cast<unsigned int>(node->children.size());
+  }
+
+  void Rebuild(const mte::TagDocument& document) {
+    BeforeReset();
+    roots_.clear();
+
+    const auto fields = mte::editable_fields(document);
+    for (const auto& target : mte::editable_targets(document)) {
+      auto group = std::make_unique<ViewNode>();
+      group->data.kind = ItemKind::Group;
+      group->data.target = target;
+      group->label = group_label(target, document.tracks);
+
+      for (const auto& field : fields) {
+        if (!same_target(field.target, target)) {
+          continue;
+        }
+
+        auto child = std::make_unique<ViewNode>();
+        child->data.kind = ItemKind::Field;
+        child->data.target = field.target;
+        child->data.tag_index = field.tag_index;
+        child->data.simple_path = field.simple_path;
+        child->name = field.name;
+        child->value = field.value;
+        child->parent = group.get();
+        group->children.push_back(std::move(child));
+      }
+
+      roots_.push_back(std::move(group));
+    }
+
+    AfterReset();
+  }
+
+  std::vector<wxDataViewItem> RootItems() const {
+    std::vector<wxDataViewItem> items;
+    for (const auto& root : roots_) {
+      items.push_back(ItemFromNode(root.get()));
+    }
+    return items;
+  }
+
+  void CollectFieldItems(wxDataViewItemArray& items) const {
+    for (const auto& root : roots_) {
+      CollectFieldItems(*root, items);
+    }
+  }
+
+  wxDataViewItem FindField(std::size_t tag_index,
+                           const std::vector<std::size_t>& simple_path) const {
+    for (const auto& root : roots_) {
+      for (const auto& child : root->children) {
+        if (child->data.kind == ItemKind::Field &&
+            child->data.tag_index == tag_index &&
+            child->data.simple_path == simple_path) {
+          return ItemFromNode(child.get());
+        }
+      }
+    }
+    return wxDataViewItem();
+  }
+
+  ItemData* DataForItem(const wxDataViewItem& item) {
+    auto* node = NodeFromItem(item);
+    return node ? &node->data : nullptr;
+  }
+
+  const ItemData* DataForItem(const wxDataViewItem& item) const {
+    const auto* node = NodeFromItem(item);
+    return node ? &node->data : nullptr;
+  }
+
+ private:
+  static wxDataViewItem ItemFromNode(const ViewNode* node) {
+    return wxDataViewItem(const_cast<ViewNode*>(node));
+  }
+
+  static ViewNode* NodeFromItem(const wxDataViewItem& item) {
+    return static_cast<ViewNode*>(item.GetID());
+  }
+
+  static void CollectFieldItems(const ViewNode& node, wxDataViewItemArray& items) {
+    if (node.data.kind == ItemKind::Field) {
+      items.Add(ItemFromNode(&node));
+    }
+    for (const auto& child : node.children) {
+      CollectFieldItems(*child, items);
+    }
+  }
+
+  std::vector<std::unique_ptr<ViewNode>> roots_;
+};
+
 class MainFrame;
 
 class FileDropTarget final : public wxFileDropTarget {
@@ -232,10 +424,17 @@ class MainFrame final : public wxFrame {
       action_row->Add(button, 0, wxEXPAND | wxRIGHT | wxBOTTOM, 4);
     }
 
-    tree_ = new wxTreeListCtrl(panel, ID_TREE, wxDefaultPosition, wxDefaultSize,
-                               wxTL_MULTIPLE | wxTL_DEFAULT_STYLE);
-    tree_->AppendColumn("Name", kNameColumnMinWidth);
-    tree_->AppendColumn("Value", kValueColumnMinWidth);
+    tree_ = new wxDataViewCtrl(panel, ID_TREE, wxDefaultPosition, wxDefaultSize,
+                               wxDV_MULTIPLE | wxDV_ROW_LINES);
+    tree_->AppendTextColumn("Name", 0, wxDATAVIEW_CELL_INERT,
+                            kNameColumnMinWidth, wxALIGN_LEFT,
+                            wxDATAVIEW_COL_RESIZABLE);
+    tree_->AppendTextColumn("Value", 1, wxDATAVIEW_CELL_INERT,
+                            kValueColumnMinWidth, wxALIGN_LEFT,
+                            wxDATAVIEW_COL_RESIZABLE);
+    model_ = new TagTreeModel();
+    tree_->AssociateModel(model_);
+    model_->DecRef();
     tree_->SetDropTarget(new FileDropTarget(this));
 
     root->Add(file_row, 0, wxEXPAND);
@@ -277,11 +476,11 @@ class MainFrame final : public wxFrame {
     Bind(wxEVT_MENU, &MainFrame::OnRedo, this, ID_REDO);
     Bind(wxEVT_MENU, &MainFrame::OnSelectAll, this, ID_SELECT_ALL);
     Bind(wxEVT_CLOSE_WINDOW, &MainFrame::OnClose, this);
-    Bind(wxEVT_TREELIST_ITEM_ACTIVATED, &MainFrame::OnItemActivated, this, ID_TREE);
-    Bind(wxEVT_TREELIST_SELECTION_CHANGED, &MainFrame::OnSelectionChanged, this, ID_TREE);
-    Bind(wxEVT_TREELIST_ITEM_CONTEXT_MENU, &MainFrame::OnContextMenu, this, ID_TREE);
+    Bind(wxEVT_DATAVIEW_ITEM_ACTIVATED, &MainFrame::OnItemActivated, this, ID_TREE);
+    Bind(wxEVT_DATAVIEW_SELECTION_CHANGED, &MainFrame::OnSelectionChanged, this, ID_TREE);
+    Bind(wxEVT_DATAVIEW_ITEM_CONTEXT_MENU, &MainFrame::OnContextMenu, this, ID_TREE);
     Bind(wxEVT_SIZE, &MainFrame::OnSize, this);
-    tree_->GetDataView()->Bind(wxEVT_LEFT_DCLICK, &MainFrame::OnTreeDoubleClick, this);
+    tree_->Bind(wxEVT_LEFT_DCLICK, &MainFrame::OnTreeDoubleClick, this);
   }
 
   bool ConfirmDiscard() {
@@ -416,14 +615,9 @@ class MainFrame final : public wxFrame {
   }
 
   void OnSelectAll(wxCommandEvent&) {
-    wxTreeListItem item = tree_->GetFirstItem();
-    while (item.IsOk()) {
-      if (auto* data = static_cast<ItemData*>(tree_->GetItemData(item));
-          data && data->kind == ItemKind::Field) {
-        tree_->Select(item);
-      }
-      item = tree_->GetNextItem(item);
-    }
+    wxDataViewItemArray items;
+    model_->CollectFieldItems(items);
+    tree_->SetSelections(items);
     RefreshCommands();
   }
 
@@ -435,7 +629,7 @@ class MainFrame final : public wxFrame {
     event.Veto();
   }
 
-  void OnSelectionChanged(wxTreeListEvent&) {
+  void OnSelectionChanged(wxDataViewEvent&) {
     RefreshCommands();
   }
 
@@ -448,10 +642,9 @@ class MainFrame final : public wxFrame {
   }
 
   void OnTreeDoubleClick(wxMouseEvent& event) {
-    auto* view = tree_->GetDataView();
     wxDataViewItem data_view_item;
     wxDataViewColumn* data_view_column = nullptr;
-    view->HitTest(event.GetPosition(), data_view_item, data_view_column);
+    tree_->HitTest(event.GetPosition(), data_view_item, data_view_column);
     if (!data_view_item.IsOk() || !data_view_column) {
       event.Skip();
       return;
@@ -463,24 +656,23 @@ class MainFrame final : public wxFrame {
       return;
     }
 
-    wxTreeListItem item(static_cast<wxTreeListModelNode*>(data_view_item.GetID()));
-    auto* data = static_cast<ItemData*>(tree_->GetItemData(item));
+    auto* data = model_->DataForItem(data_view_item);
     if (!data || data->kind != ItemKind::Field) {
       event.Skip();
       return;
     }
 
-    StartInlineEdit(item, column);
+    StartInlineEdit(data_view_item, column);
   }
 
-  void OnContextMenu(wxTreeListEvent& event) {
+  void OnContextMenu(wxDataViewEvent& event) {
     const auto item = event.GetItem();
     if (item.IsOk()) {
       tree_->Select(item);
     }
 
     wxMenu menu;
-    auto* data = SelectedData().empty() ? nullptr : SelectedData().front();
+    auto* data = item.IsOk() ? model_->DataForItem(item) : nullptr;
     const auto is_group = data && data->kind == ItemKind::Group;
     if (is_group) {
       const auto group_has_tags = GroupHasVisibleTags(*data);
@@ -512,8 +704,8 @@ class MainFrame final : public wxFrame {
     PopupMenu(&menu);
   }
 
-  void OnItemActivated(wxTreeListEvent& event) {
-    auto* data = static_cast<ItemData*>(tree_->GetItemData(event.GetItem()));
+  void OnItemActivated(wxDataViewEvent& event) {
+    auto* data = model_->DataForItem(event.GetItem());
     if (!data || data->kind != ItemKind::Field) {
       return;
     }
@@ -522,16 +714,21 @@ class MainFrame final : public wxFrame {
   }
 
   void PopulateTree() {
-    populating_tree_ = true;
-    inline_item_to_edit_.Unset();
-    tree_->DeleteAllItems();
-    auto root = tree_->GetRootItem();
-    const auto fields = mte::editable_fields(document_);
-    for (const auto& target : mte::editable_targets(document_)) {
-      AppendGroup(root, target, fields);
+    inline_item_to_edit_ = wxDataViewItem();
+    model_->Rebuild(document_);
+    for (const auto& item : model_->RootItems()) {
+      tree_->Expand(item);
     }
     ResizeColumns();
-    populating_tree_ = false;
+    if (pending_inline_edit_) {
+      const auto item =
+          model_->FindField(pending_inline_edit_->tag_index,
+                            pending_inline_edit_->simple_path);
+      if (item.IsOk()) {
+        inline_item_to_edit_ = item;
+        inline_column_to_edit_ = pending_inline_edit_->column;
+      }
+    }
     if (inline_item_to_edit_.IsOk()) {
       const auto item = inline_item_to_edit_;
       const auto column = inline_column_to_edit_;
@@ -544,48 +741,13 @@ class MainFrame final : public wxFrame {
     }
   }
 
-  void AppendGroup(wxTreeListItem root,
-                   mte::EditableTarget target,
-                   const std::vector<mte::EditableField>& fields) {
-    auto* group_data = new ItemData();
-    group_data->kind = ItemKind::Group;
-    group_data->target = target;
-
-    const auto group =
-        tree_->AppendItem(root, wxString::FromUTF8(group_label(target, document_.tracks)),
-                          -1, -1, group_data);
-    tree_->SetItemText(group, 1, "");
-
-    for (const auto& field : fields) {
-      if (!same_target(field.target, target)) {
-        continue;
-      }
-      auto* data = new ItemData();
-      data->kind = ItemKind::Field;
-      data->target = field.target;
-      data->tag_index = field.tag_index;
-      data->simple_path = field.simple_path;
-
-      const auto item =
-          tree_->AppendItem(group, wxString::FromUTF8(field.name), -1, -1, data);
-      tree_->SetItemText(item, 1, wxString::FromUTF8(field.value));
-      if (pending_inline_edit_ &&
-          pending_inline_edit_->tag_index == field.tag_index &&
-          pending_inline_edit_->simple_path == field.simple_path) {
-        inline_item_to_edit_ = item;
-        inline_column_to_edit_ = pending_inline_edit_->column;
-      }
-    }
-    tree_->Expand(group);
-  }
-
   std::vector<ItemData*> SelectedData() const {
-    wxTreeListItems selected;
+    wxDataViewItemArray selected;
     tree_->GetSelections(selected);
     std::vector<ItemData*> data;
     for (const auto& item : selected) {
       if (item.IsOk()) {
-        if (auto* item_data = static_cast<ItemData*>(tree_->GetItemData(item))) {
+        if (auto* item_data = model_->DataForItem(item)) {
           data.push_back(item_data);
         }
       }
@@ -637,8 +799,12 @@ class MainFrame final : public wxFrame {
     const auto name_width =
         std::max(kNameColumnMinWidth, std::min(190, available * 38 / 100));
     const auto value_width = std::max(kValueColumnMinWidth, available - name_width);
-    tree_->SetColumnWidth(0, name_width);
-    tree_->SetColumnWidth(1, value_width);
+    if (auto* column = tree_->GetColumn(0)) {
+      column->SetWidth(name_width);
+    }
+    if (auto* column = tree_->GetColumn(1)) {
+      column->SetWidth(value_width);
+    }
   }
 
   std::string FieldName(const ItemData& data) const {
@@ -659,15 +825,6 @@ class MainFrame final : public wxFrame {
       }
     }
     return {};
-  }
-
-  void ApplyField(const ItemData& data, const std::string& name, const std::string& value) {
-    if (data.tag_index < document_.tags.size()) {
-      if (auto* tag = find_simple(document_.tags[data.tag_index], data.simple_path)) {
-        tag->name = name;
-        tag->string_value = value;
-      }
-    }
   }
 
   void ApplyFieldColumn(const ItemData& data, unsigned column, const std::string& value) {
@@ -787,7 +944,7 @@ class MainFrame final : public wxFrame {
     return false;
   }
 
-  void StartInlineEdit(wxTreeListItem item, unsigned column) {
+  void StartInlineEdit(wxDataViewItem item, unsigned column) {
     if (inline_editor_) {
       FinishInlineEdit(true);
       return;
@@ -795,19 +952,17 @@ class MainFrame final : public wxFrame {
     if (!item.IsOk() || column > 1) {
       return;
     }
-    auto* data = static_cast<ItemData*>(tree_->GetItemData(item));
+    auto* data = model_->DataForItem(item);
     if (!data || data->kind != ItemKind::Field) {
       return;
     }
 
-    auto* view = tree_->GetDataView();
-    auto* data_view_column = view->GetColumn(column);
+    auto* data_view_column = tree_->GetColumn(column);
     if (!data_view_column) {
       return;
     }
 
-    wxDataViewItem data_view_item(static_cast<void*>(item.GetID()));
-    auto rect = view->GetItemRect(data_view_item, data_view_column);
+    auto rect = tree_->GetItemRect(item, data_view_column);
     if (rect.IsEmpty()) {
       return;
     }
@@ -818,9 +973,9 @@ class MainFrame final : public wxFrame {
     inline_column_ = column;
     inline_original_value_ = value;
     inline_editor_ =
-        new wxTextCtrl(view, ID_INLINE_EDITOR, wxString::FromUTF8(value), rect.GetPosition(),
+        new wxTextCtrl(tree_, ID_INLINE_EDITOR, wxString::FromUTF8(value), rect.GetPosition(),
                        rect.GetSize(), wxTE_PROCESS_ENTER);
-    inline_editor_->SetFont(view->GetFont());
+    inline_editor_->SetFont(tree_->GetFont());
     inline_editor_->SetSelection(-1, -1);
     inline_editor_->Bind(wxEVT_TEXT_ENTER, &MainFrame::OnInlineTextEnter, this);
     inline_editor_->Bind(wxEVT_CHAR_HOOK, &MainFrame::OnInlineCharHook, this);
@@ -867,7 +1022,7 @@ class MainFrame final : public wxFrame {
     const auto item = inline_item_;
     const auto column = inline_column_;
     inline_editor_ = nullptr;
-    inline_item_.Unset();
+    inline_item_ = wxDataViewItem();
     inline_column_ = 0;
     editor->Destroy();
     ending_inline_edit_ = false;
@@ -881,7 +1036,7 @@ class MainFrame final : public wxFrame {
     if (!item.IsOk()) {
       return;
     }
-    auto* data = static_cast<ItemData*>(tree_->GetItemData(item));
+    auto* data = model_->DataForItem(item);
     if (data && data->kind == ItemKind::Field) {
       ApplyFieldColumn(*data, column, value);
       PushHistory();
@@ -909,7 +1064,8 @@ class MainFrame final : public wxFrame {
   wxButton* paste_button_ = nullptr;
   wxButton* undo_button_ = nullptr;
   wxButton* redo_button_ = nullptr;
-  wxTreeListCtrl* tree_ = nullptr;
+  wxDataViewCtrl* tree_ = nullptr;
+  TagTreeModel* model_ = nullptr;
   wxTextCtrl* inline_editor_ = nullptr;
 
   mte::TagDocument document_;
@@ -917,14 +1073,13 @@ class MainFrame final : public wxFrame {
   std::vector<mte::SimpleTag> clipboard_;
   std::size_t history_index_ = 0;
   std::size_t saved_history_index_ = 0;
-  wxTreeListItem inline_item_;
+  wxDataViewItem inline_item_;
   unsigned inline_column_ = 0;
   std::string inline_original_value_;
   std::optional<InlineEditRequest> pending_inline_edit_;
-  wxTreeListItem inline_item_to_edit_;
+  wxDataViewItem inline_item_to_edit_;
   unsigned inline_column_to_edit_ = 0;
   bool dirty_ = false;
-  bool populating_tree_ = false;
   bool ending_inline_edit_ = false;
 };
 
