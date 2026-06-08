@@ -88,7 +88,7 @@ std::string track_label(const mte::TrackInfo& track,
 
 std::string group_label(const mte::EditableTarget& target,
                         const std::vector<mte::TrackInfo>& tracks) {
-  std::string prefix = "General";
+  std::string prefix = "Global";
   if (target.kind == mte::EditableTargetKind::Track) {
     prefix = "Track " + std::to_string(target.track_uid);
     for (const auto& track : tracks) {
@@ -388,6 +388,9 @@ class MainFrame final : public wxFrame {
   }
 
   void OpenPath(const std::filesystem::path& path) {
+    if (path.empty()) {
+      return;
+    }
     if (!ConfirmDiscard()) {
       return;
     }
@@ -407,8 +410,6 @@ class MainFrame final : public wxFrame {
     open_button_ = new wxButton(panel, wxID_OPEN, "Open");
     save_button_ = new wxButton(panel, wxID_SAVE, "Save");
     InstallFileDropTarget(path_ctrl_);
-    InstallFileDropTarget(open_button_);
-    InstallFileDropTarget(save_button_);
     file_row->Add(path_ctrl_, 1, wxEXPAND | wxALL, 4);
     file_row->Add(open_button_, 0, wxEXPAND | wxTOP | wxBOTTOM | wxRIGHT, 4);
     file_row->Add(save_button_, 0, wxEXPAND | wxTOP | wxBOTTOM | wxRIGHT, 4);
@@ -426,7 +427,6 @@ class MainFrame final : public wxFrame {
     for (auto* button : {add_button_, delete_button_, copy_button_, paste_button_,
                          undo_button_, redo_button_}) {
       button->SetMinSize(compact_button_size);
-      InstallFileDropTarget(button);
       action_row->Add(button, 0, wxEXPAND | wxRIGHT | wxBOTTOM, 4);
     }
 
@@ -521,10 +521,6 @@ class MainFrame final : public wxFrame {
   }
 
   void OnOpen(wxCommandEvent&) {
-    if (!ConfirmDiscard()) {
-      return;
-    }
-
     wxFileDialog dialog(this,
                         "Open Matroska file",
                         "",
@@ -534,7 +530,7 @@ class MainFrame final : public wxFrame {
     if (dialog.ShowModal() == wxID_CANCEL) {
       return;
     }
-    LoadPath(std::filesystem::path(dialog.GetPath().ToStdString()));
+    OpenPath(std::filesystem::path(dialog.GetPath().ToStdString()));
   }
 
   void OnSave(wxCommandEvent&) {
