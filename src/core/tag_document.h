@@ -99,6 +99,8 @@ bool is_hidden_extra_tag_name(const std::string& name);
 
 std::string editable_display_text(const std::string& value);
 
+int inline_editor_height(int cell_height, int best_height, int vertical_padding);
+
 std::vector<EditableTarget> editable_targets(const TagDocument& document);
 
 EditableField add_extra_tag(TagDocument& document,

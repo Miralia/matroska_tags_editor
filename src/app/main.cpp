@@ -975,15 +975,23 @@ class MainFrame final : public wxFrame {
       return;
     }
 
-    rect.Deflate(1, 1);
     const auto value = column == 0 ? FieldName(*data) : FieldValue(*data);
     inline_item_ = item;
     inline_column_ = column;
     inline_original_value_ = value;
     inline_editor_ =
-        new wxTextCtrl(tree_, ID_INLINE_EDITOR, wxString::FromUTF8(value), rect.GetPosition(),
-                       rect.GetSize(), wxTE_PROCESS_ENTER);
+        new wxTextCtrl(tree_, ID_INLINE_EDITOR, wxString::FromUTF8(value),
+                       wxDefaultPosition, wxDefaultSize, wxTE_PROCESS_ENTER);
     inline_editor_->SetFont(tree_->GetFont());
+    const auto original_height = rect.GetHeight();
+    rect.Deflate(1, 0);
+    const auto editor_height =
+        mte::inline_editor_height(original_height,
+                                  inline_editor_->GetBestSize().GetHeight(),
+                                  tree_->FromDIP(4));
+    rect.SetY(std::max(0, rect.GetY() - (editor_height - original_height) / 2));
+    rect.SetHeight(editor_height);
+    inline_editor_->SetSize(rect);
     inline_editor_->SetSelection(-1, -1);
     inline_editor_->Bind(wxEVT_TEXT_ENTER, &MainFrame::OnInlineTextEnter, this);
     inline_editor_->Bind(wxEVT_CHAR_HOOK, &MainFrame::OnInlineCharHook, this);
