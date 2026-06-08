@@ -212,8 +212,9 @@ class TagTreeModel final : public wxDataViewModel {
       return;
     }
 
+    const auto is_editing = node == active_edit_node_ && column == active_edit_column_;
     variant = wxString::FromUTF8(
-        mte::editable_display_text(column == 0 ? node->name : node->value));
+        mte::editable_cell_text(column == 0 ? node->name : node->value, is_editing));
   }
 
   bool SetValue(const wxVariant& variant,
@@ -300,6 +301,7 @@ class TagTreeModel final : public wxDataViewModel {
   void Rebuild(const mte::TagDocument& document) {
     BeforeReset();
     roots_.clear();
+    active_edit_node_ = nullptr;
 
     const auto fields = mte::editable_fields(document);
     for (const auto& target : mte::editable_targets(document)) {
@@ -376,6 +378,16 @@ class TagTreeModel final : public wxDataViewModel {
     return column == 0 ? node->name : node->value;
   }
 
+  void SetActiveEdit(const wxDataViewItem& item, unsigned column) {
+    active_edit_node_ = NodeFromItem(item);
+    active_edit_column_ = column;
+  }
+
+  void ClearActiveEdit() {
+    active_edit_node_ = nullptr;
+    active_edit_column_ = 0;
+  }
+
  private:
   static wxDataViewItem ItemFromNode(const ViewNode* node) {
     return wxDataViewItem(const_cast<ViewNode*>(node));
@@ -395,6 +407,8 @@ class TagTreeModel final : public wxDataViewModel {
   }
 
   std::vector<std::unique_ptr<ViewNode>> roots_;
+  ViewNode* active_edit_node_ = nullptr;
+  unsigned active_edit_column_ = 0;
 };
 
 class MainFrame;
@@ -824,6 +838,7 @@ class MainFrame final : public wxFrame {
   }
 
   void PopulateTree() {
+    ClearActiveEdit();
     inline_item_to_edit_ = wxDataViewItem();
     model_->Rebuild(document_);
     for (const auto& item : model_->RootItems()) {
@@ -844,6 +859,7 @@ class MainFrame final : public wxFrame {
       const auto column = inline_column_to_edit_;
       pending_inline_edit_.reset();
       CallAfter([this, item, column]() {
+        tree_->SetCurrentItem(item);
         tree_->Select(item);
         tree_->EnsureVisible(item);
         StartInlineEdit(item, column);
@@ -1078,19 +1094,23 @@ class MainFrame final : public wxFrame {
       return;
     }
 
-    const auto defer =
-        mte::should_defer_inline_edit_until_selected(tree_->IsSelected(item));
     tree_->SetFocus();
     tree_->UnselectAll();
+    tree_->SetCurrentItem(item);
     tree_->Select(item);
     tree_->EnsureVisible(item);
 
-    if (defer) {
-      CallAfter([this, item, column]() { StartInlineEdit(item, column); });
-      return;
-    }
-
-    StartInlineEdit(item, column);
+    CallAfter([this, item, column]() {
+      if (!tree_ || !item.IsOk()) {
+        return;
+      }
+      tree_->SetFocus();
+      tree_->SetCurrentItem(item);
+      tree_->UnselectAll();
+      tree_->Select(item);
+      tree_->EnsureVisible(item);
+      StartInlineEdit(item, column);
+    });
   }
 
   bool ValidateBeforeSave() {
@@ -1158,11 +1178,17 @@ class MainFrame final : public wxFrame {
   void TrackActiveEdit(const wxDataViewItem& item, unsigned column) {
     active_edit_item_ = item;
     active_edit_column_ = column;
+    if (model_) {
+      model_->SetActiveEdit(item, column);
+    }
   }
 
   void ClearActiveEdit() {
     active_edit_item_ = wxDataViewItem();
     active_edit_column_ = 0;
+    if (model_) {
+      model_->ClearActiveEdit();
+    }
   }
 
   wxTextCtrl* path_ctrl_ = nullptr;
