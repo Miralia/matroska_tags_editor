@@ -398,12 +398,17 @@ class MainFrame final : public wxFrame {
   void BuildUi() {
     auto* panel = new wxPanel(this);
     auto* root = new wxBoxSizer(wxVERTICAL);
+    InstallFileDropTarget(this);
+    InstallFileDropTarget(panel);
 
     auto* file_row = new wxBoxSizer(wxHORIZONTAL);
     path_ctrl_ = new wxTextCtrl(panel, wxID_ANY, "", wxDefaultPosition, wxDefaultSize,
                                 wxTE_READONLY);
     open_button_ = new wxButton(panel, wxID_OPEN, "Open");
     save_button_ = new wxButton(panel, wxID_SAVE, "Save");
+    InstallFileDropTarget(path_ctrl_);
+    InstallFileDropTarget(open_button_);
+    InstallFileDropTarget(save_button_);
     file_row->Add(path_ctrl_, 1, wxEXPAND | wxALL, 4);
     file_row->Add(open_button_, 0, wxEXPAND | wxTOP | wxBOTTOM | wxRIGHT, 4);
     file_row->Add(save_button_, 0, wxEXPAND | wxTOP | wxBOTTOM | wxRIGHT, 4);
@@ -421,6 +426,7 @@ class MainFrame final : public wxFrame {
     for (auto* button : {add_button_, delete_button_, copy_button_, paste_button_,
                          undo_button_, redo_button_}) {
       button->SetMinSize(compact_button_size);
+      InstallFileDropTarget(button);
       action_row->Add(button, 0, wxEXPAND | wxRIGHT | wxBOTTOM, 4);
     }
 
@@ -435,7 +441,7 @@ class MainFrame final : public wxFrame {
     model_ = new TagTreeModel();
     tree_->AssociateModel(model_);
     model_->DecRef();
-    tree_->SetDropTarget(new FileDropTarget(this));
+    InstallFileDropTarget(tree_);
 
     root->Add(file_row, 0, wxEXPAND);
     root->Add(action_row, 0, wxLEFT | wxRIGHT, 4);
@@ -481,6 +487,12 @@ class MainFrame final : public wxFrame {
     Bind(wxEVT_DATAVIEW_ITEM_CONTEXT_MENU, &MainFrame::OnContextMenu, this, ID_TREE);
     Bind(wxEVT_SIZE, &MainFrame::OnSize, this);
     tree_->Bind(wxEVT_LEFT_DCLICK, &MainFrame::OnTreeDoubleClick, this);
+  }
+
+  void InstallFileDropTarget(wxWindow* window) {
+    if (window) {
+      window->SetDropTarget(new FileDropTarget(this));
+    }
   }
 
   bool ConfirmDiscard() {
