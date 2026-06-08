@@ -101,6 +101,8 @@ std::string editable_display_text(const std::string& value);
 
 int inline_editor_height(int cell_height, int best_height, int vertical_padding);
 
+bool can_start_inline_edit(bool is_field, unsigned column, bool has_modifier);
+
 std::optional<std::filesystem::path> first_dropped_file_path(
     const std::vector<std::filesystem::path>& paths);
 
