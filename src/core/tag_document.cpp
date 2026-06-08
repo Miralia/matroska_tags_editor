@@ -148,6 +148,10 @@ unsigned inline_edit_event_column(int event_column,
   return has_active_edit ? active_column : 0;
 }
 
+bool should_defer_inline_edit_until_selected(bool is_selected) {
+  return !is_selected;
+}
+
 std::optional<std::filesystem::path> first_dropped_file_path(
     const std::vector<std::filesystem::path>& paths) {
   for (const auto& path : paths) {

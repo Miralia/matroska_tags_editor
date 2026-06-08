@@ -738,7 +738,7 @@ class MainFrame final : public wxFrame {
       return;
     }
 
-    StartInlineEdit(target->item, target->column);
+    OpenInlineEdit(target->item, target->column);
   }
 
   void OnContextMenu(wxDataViewEvent& event) {
@@ -1071,6 +1071,26 @@ class MainFrame final : public wxFrame {
 
     TrackActiveEdit(item, column);
     tree_->EditItem(item, data_view_column);
+  }
+
+  void OpenInlineEdit(wxDataViewItem item, unsigned column) {
+    if (!tree_ || !item.IsOk()) {
+      return;
+    }
+
+    const auto defer =
+        mte::should_defer_inline_edit_until_selected(tree_->IsSelected(item));
+    tree_->SetFocus();
+    tree_->UnselectAll();
+    tree_->Select(item);
+    tree_->EnsureVisible(item);
+
+    if (defer) {
+      CallAfter([this, item, column]() { StartInlineEdit(item, column); });
+      return;
+    }
+
+    StartInlineEdit(item, column);
   }
 
   bool ValidateBeforeSave() {
